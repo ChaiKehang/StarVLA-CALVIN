@@ -1,0 +1,47 @@
+# Large/runtime-only project directories
+/logs/
+/manifests/
+/plan/
+/plan skill.md
+/runs/
+/code/
+/scripts/reference/
+/DIDIS Lab 服务器使用指南.md
+/insights.md
+
+# Python, caches and experiment products
+**/__pycache__/
+*.py[cod]
+*.log
+*.out
+*.err
+*.gif
+*.mp4
+*.avi
+*.npy
+*.npz
+*.parquet
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.pkl
+*.pickle
+*.zip
+*.tar
+*.tar.gz
+*.7z
+.env
+.env.*
+wandb/
+.cache/
+
+# Keep only compact result summaries from evaluation runs.
+/eval_logs/*
+!/eval_logs/e0_abc_rel/
+/eval_logs/e0_abc_rel/*
+!/eval_logs/e0_abc_rel/*/
+/eval_logs/e0_abc_rel/*/*
+!/eval_logs/e0_abc_rel/*/results.json

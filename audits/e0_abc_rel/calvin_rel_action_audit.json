@@ -1,0 +1,163 @@
+{
+  "created_at_utc": "2026-07-01T16:27:27.717683+00:00",
+  "status": "blocked_missing_full_original_calvin_abc_d_training_npz",
+  "original_split_dir": "/home/data/datasets/kehang-CALVIN/calvin/original/task_ABC_D/training",
+  "raw_sixpigs_dir": "/home/data/datasets/kehang-CALVIN/calvin/lerobot/sixpigs1_calvin2lerobotV21_ABC_D_scnet_raw",
+  "derived_rel_dir": "/home/data/datasets/kehang-CALVIN/calvin/lerobot/sixpigs1_calvin2lerobotV21_ABC_D_scnet_rel",
+  "samples_requested": 100,
+  "seed": 42,
+  "calvin_rel_scale_candidate": [
+    50.0,
+    50.0,
+    50.0,
+    20.0,
+    20.0,
+    20.0,
+    1.0
+  ],
+  "original_status": {
+    "expected_original_split_dir": "/home/data/datasets/kehang-CALVIN/calvin/original/task_ABC_D/training",
+    "exists": false,
+    "sample_npz_count_in_expected_dir": 0,
+    "nearby_npz_examples": [
+      "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/training/episode_0358482.npz",
+      "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/training/episode_0358483.npz",
+      "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/training/episode_0358484.npz",
+      "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/training/episode_0358485.npz",
+      "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/training/episode_0358486.npz",
+      "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/training/episode_0358487.npz",
+      "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/training/episode_0358488.npz",
+      "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/training/episode_0358489.npz",
+      "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/training/episode_0358490.npz",
+      "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/training/episode_0358491.npz"
+    ]
+  },
+  "debug_scale_diagnostic": {
+    "available": true,
+    "debug_dir": "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/validation",
+    "num_debug_samples": 100,
+    "median_scale_first6": [
+      50.0,
+      50.0,
+      50.0,
+      20.0,
+      20.000000000000025,
+      20.0
+    ],
+    "min_scale_first6": [
+      49.99999999999999,
+      49.99999999999999,
+      50.0,
+      20.0,
+      19.9999999999972,
+      19.999999999961705
+    ],
+    "max_scale_first6": [
+      50.0,
+      50.00000000000001,
+      50.0,
+      20.0,
+      20.000000000002295,
+      20.000000000121883
+    ],
+    "expected_scale_used_by_audit": [
+      50.0,
+      50.0,
+      50.0,
+      20.0,
+      20.0,
+      20.0,
+      1.0
+    ],
+    "examples": [
+      {
+        "file": "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/validation/episode_0553567.npz",
+        "delta_actions_minus_robot_obs_first6": [
+          0.011718310467974162,
+          9.144031575976375e-05,
+          0.0005063445005181189,
+          0.001392290125691087,
+          -0.002606610475057808,
+          -0.0239206821708966
+        ],
+        "rel_actions_first6": [
+          0.5859155233987081,
+          0.004572015787988187,
+          0.025317225025905943,
+          0.027845802513821738,
+          -0.05213220950115449,
+          -0.478413643417932
+        ],
+        "ratio_first6": [
+          50.0,
+          50.0,
+          50.0,
+          20.0,
+          19.99999999999936,
+          20.0
+        ],
+        "gripper_action": 1.0,
+        "gripper_rel_action": 1.0
+      },
+      {
+        "file": "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/validation/episode_0553568.npz",
+        "delta_actions_minus_robot_obs_first6": [
+          0.009621971599324371,
+          0.0006195459960121885,
+          0.0008729984258076806,
+          -0.0125033900166871,
+          -0.005131605090276242,
+          -0.015744605209101925
+        ],
+        "rel_actions_first6": [
+          0.4810985799662186,
+          0.030977299800609426,
+          0.04364992129038403,
+          -0.250067800333742,
+          -0.10263210180552207,
+          -0.31489210418204294
+        ],
+        "ratio_first6": [
+          50.0,
+          50.0,
+          50.0,
+          20.0,
+          19.99999999999946,
+          20.00000000000028
+        ],
+        "gripper_action": 1.0,
+        "gripper_rel_action": 1.0
+      },
+      {
+        "file": "/home/data/datasets/kehang-CALVIN/calvin/original/calvin_debug_dataset/validation/episode_0553569.npz",
+        "delta_actions_minus_robot_obs_first6": [
+          0.006944655266931813,
+          0.0006692093431317769,
+          0.001070578003097733,
+          -0.00731989926707044,
+          -0.0026981528189792825,
+          -0.012972725458508139
+        ],
+        "rel_actions_first6": [
+          0.34723276334659064,
+          0.03346046715658885,
+          0.05352890015488665,
+          -0.1463979853414088,
+          -0.05396305637958676,
+          -0.25945450917015833
+        ],
+        "ratio_first6": [
+          50.0,
+          50.0,
+          50.0,
+          20.0,
+          20.000000000000412,
+          19.99999999999966
+        ],
+        "gripper_action": 1.0,
+        "gripper_rel_action": 1.0
+      }
+    ]
+  },
+  "reason": "Full original CALVIN task_ABC_D/training npz files are required. Only debug validation npz files were found locally, which do not align with sixpigs ABC-D training episode/timestep ids."
+}
