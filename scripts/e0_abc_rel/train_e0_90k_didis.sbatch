@@ -45,7 +45,7 @@ fi
 source /home/liuchang/miniconda3/bin/activate starvla-e0
 
 export PROJECT_ROOT MODEL_ROOT LEROBOT_ROOT CHECKPOINT_ROOT CACHE_ROOT
-export STARVLA_DIR="${PROJECT_ROOT}/code/starvla"
+export STARVLA_DIR="${PROJECT_ROOT}/third_party/starvla"
 export CONFIG_YAML="${PROJECT_ROOT}/configs/starvla/e0_abc_rel_calvin_scaled_90k.yaml"
 export NUM_PROCESSES=2
 export PER_DEVICE_BATCH_SIZE=8

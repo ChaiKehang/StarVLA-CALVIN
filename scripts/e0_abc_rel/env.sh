@@ -7,8 +7,8 @@
 # tokens or other credentials in this file.
 
 export PROJECT=/home/liuchang/kehang/488project
-export STARVLA_DIR="$PROJECT/code/starvla"
-export CALVIN_DIR="$PROJECT/code/calvin"
+export STARVLA_DIR="$PROJECT/third_party/starvla"
+export CALVIN_DIR="$PROJECT/third_party/calvin"
 
 export RUN_ID=e0_abc_rel
 export RUN_DIR="$PROJECT/runs/$RUN_ID"

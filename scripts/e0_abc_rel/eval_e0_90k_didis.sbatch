@@ -29,8 +29,8 @@ if tr ',' '\n' <<<"${ALLOCATED_GPUS}" | sed 's/^gpu://; s/^[[:space:]]*//; s/[[:
 fi
 
 export PROJECT_ROOT
-export STARVLA_DIR="${PROJECT_ROOT}/code/starvla"
-export CALVIN_DIR="${PROJECT_ROOT}/code/calvin"
+export STARVLA_DIR="${PROJECT_ROOT}/third_party/starvla"
+export CALVIN_DIR="${PROJECT_ROOT}/third_party/calvin"
 export EVO_DIR="${PROJECT_ROOT}/scripts/reference/Evo-1_sixpigs"
 export STARVLA_PYTHON=/home/liuchang/miniconda3/envs/starvla-e0/bin/python
 export CALVIN_PYTHON=/home/liuchang/miniconda3/envs/calvin-eval/bin/python

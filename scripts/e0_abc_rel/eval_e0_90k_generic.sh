@@ -6,8 +6,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
-STARVLA_DIR="${STARVLA_DIR:-${PROJECT_ROOT}/code/starvla}"
-CALVIN_DIR="${CALVIN_DIR:-${PROJECT_ROOT}/code/calvin}"
+STARVLA_DIR="${STARVLA_DIR:-${PROJECT_ROOT}/third_party/starvla}"
+CALVIN_DIR="${CALVIN_DIR:-${PROJECT_ROOT}/third_party/calvin}"
 EVO_DIR="${EVO_DIR:-${PROJECT_ROOT}/scripts/reference/Evo-1_sixpigs}"
 
 : "${CKPT90K:?Set CKPT90K to steps_90000_pytorch_model.pt}"

@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
-STARVLA_DIR="${STARVLA_DIR:-${PROJECT_ROOT}/code/starvla}"
+STARVLA_DIR="${STARVLA_DIR:-${PROJECT_ROOT}/third_party/starvla}"
 CONFIG_YAML="${CONFIG_YAML:-${PROJECT_ROOT}/configs/starvla/e0_abc_rel_calvin_scaled_90k.yaml}"
 
 : "${LEROBOT_ROOT:?Set LEROBOT_ROOT to the directory containing the derived LeRobot dataset}"
