@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+git push -u origin main#!/usr/bin/env bash
 # Start the 90k policy server and run CALVIN evaluation in one allocation.
 # The caller controls CUDA visibility; this script never selects a physical GPU.
 
