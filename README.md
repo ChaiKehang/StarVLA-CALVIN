@@ -521,7 +521,28 @@ PY
 
 
 
-## 9. 主要来源
+## 9. E1 Intent 系列
+
+当前 vendored StarVLA 源码包含三套通过 YAML 开关选择的 Intent 实验：
+
+| 实验 | Action 条件方式 | 配置 |
+|---|---|---|
+| E1-B | 125 类 soft Intent 加入 timestep condition | `e1_b_abc_rel_calvin_scaled_intent125.yaml` |
+| E1-C | E1-B 加逐层 FFN-FiLM | `e1_c_abc_rel_calvin_scaled_intent125_ffn_film.yaml` |
+| Spatial Intent v2 | 九层两级 Query Transformer，配合 Query/FFN-FiLM | `e1_spatial_intent_*_query_ffn_v2*.yaml` |
+
+Spatial Intent v2 先独立训练 S0，再运行总计 90k Action optimizer steps 的
+S1/S2：
+
+```bash
+bash scripts/e1_abc_intent/train_e1_spatial_intent_s0_query_ffn_v2.sh
+bash scripts/e1_abc_intent/train_e1_spatial_intent_s1_s2_query_ffn_v2_90k.sh
+```
+
+启动脚本默认使用 `third_party/starvla`，只允许一到两张可见 GPU，并继承现有
+RAM/GPU watchdog。模型、数据集和 checkpoint 路径仍通过环境变量配置，不提交到 Git。
+
+## 10. 主要来源
 
 - [StarVLA upstream](https://github.com/starVLA/starVLA)
 - [CALVIN upstream](https://github.com/mees/calvin)

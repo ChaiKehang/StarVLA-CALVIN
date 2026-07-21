@@ -163,6 +163,115 @@ class VLATrainer(TrainerUtils):
             * self.accelerator.gradient_accumulation_steps
         )
 
+    @staticmethod
+    def _module_grad_norm(module: torch.nn.Module):
+        """Return a pre-clipping L2 gradient norm, or None when no gradient exists."""
+
+        return VLATrainer._parameters_grad_norm(module.parameters())
+
+    @staticmethod
+    def _parameters_grad_norm(parameters):
+        """Return an L2 norm for a parameter iterable without re-registering modules."""
+
+        squared_norm = None
+        for parameter in parameters:
+            if parameter.grad is None:
+                continue
+            contribution = parameter.grad.detach().float().square().sum()
+            squared_norm = contribution if squared_norm is None else squared_norm + contribution
+        return squared_norm.sqrt() if squared_norm is not None else None
+
+    def _collect_intent_gradient_metrics(self, model):
+        """Collect E1 pre-clipping norms only on steps that will be logged."""
+
+        gradient_metrics = {}
+        monitored_modules = {
+            "action_model/grad_norm": getattr(model, "action_model", None),
+            "intent_head/grad_norm": getattr(model, "intent_head", None),
+            "intent_to_timestep/grad_norm": getattr(model, "intent_to_timestep", None),
+        }
+        intent_head = getattr(model, "intent_head", None)
+        if intent_head is not None:
+            monitored_modules.update(
+                {
+                    "intent_project_layers/grad_norm": getattr(
+                        intent_head, "project_layers", None
+                    ),
+                    "intent_token_attention/grad_norm": getattr(
+                        intent_head, "token_attention", None
+                    ),
+                    "intent_token_query_attention/grad_norm": getattr(
+                        getattr(intent_head, "token_query_block", None),
+                        "attention",
+                        None,
+                    ),
+                    "intent_token_query_ffn/grad_norm": getattr(
+                        getattr(intent_head, "token_query_block", None),
+                        "ffn",
+                        None,
+                    ),
+                    "intent_layer_attention/grad_norm": getattr(
+                        intent_head, "layer_attention", None
+                    ),
+                    "intent_layer_query_attention/grad_norm": getattr(
+                        getattr(intent_head, "layer_query_block", None),
+                        "attention",
+                        None,
+                    ),
+                    "intent_layer_query_ffn/grad_norm": getattr(
+                        getattr(intent_head, "layer_query_block", None),
+                        "ffn",
+                        None,
+                    ),
+                    "intent_classifier/grad_norm": getattr(
+                        intent_head, "classifier", None
+                    ),
+                }
+            )
+        action_dit = getattr(getattr(model, "action_model", None), "model", None)
+        if action_dit is not None:
+            transformer_blocks = getattr(action_dit, "transformer_blocks", [])
+            film_parameter_groups = {
+                "query_film/grad_norm": (
+                    parameter
+                    for block in transformer_blocks
+                    for module in [getattr(block, "cross_attn_query_intent_film", None)]
+                    if module is not None
+                    for parameter in module.parameters()
+                ),
+                "ffn_film/grad_norm": (
+                    parameter
+                    for block in transformer_blocks
+                    for module in [getattr(block, "ffn_intent_film", None)]
+                    if module is not None
+                    for parameter in module.parameters()
+                ),
+            }
+            for metric_name, parameters in film_parameter_groups.items():
+                grad_norm = self._parameters_grad_norm(parameters)
+                if grad_norm is not None:
+                    gradient_metrics[metric_name] = grad_norm.detach().item()
+        for metric_name, module in monitored_modules.items():
+            if module is None:
+                continue
+            grad_norm = self._module_grad_norm(module)
+            if grad_norm is not None:
+                gradient_metrics[metric_name] = grad_norm.detach().item()
+        return gradient_metrics
+
+    def _metric_scalar(self, value, *, aggregate: bool) -> float:
+        """Convert a scalar to float, averaging ranks on logging steps."""
+
+        if isinstance(value, torch.Tensor):
+            scalar = value.detach().float().reshape(1)
+        else:
+            scalar = torch.tensor(
+                [float(value)], device=self.accelerator.device, dtype=torch.float32
+            )
+        if aggregate and self.accelerator.num_processes > 1:
+            scalar = self.accelerator.gather_for_metrics(scalar).mean().reshape(1)
+        return scalar.item()
+
     def _init_wandb(self):
         """Initialize Weights & Biases (best-effort; must not block training)."""
         self._wandb_enabled = False
@@ -237,6 +346,30 @@ class VLATrainer(TrainerUtils):
         if pretrained_checkpoint:
             reload_modules = getattr(self.config.trainer, "reload_modules", None)
             self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
+            initialize_intent_projectors = bool(
+                self.config.framework.get("intent", {}).get(
+                    "initialize_projectors_from_action", False
+                )
+            )
+            if initialize_intent_projectors and hasattr(
+                self.model, "initialize_intent_projectors_from_action"
+            ):
+                self.model.initialize_intent_projectors_from_action()
+                logger.info("Initialized independent Intent projectors from Action projectors")
+
+            intent_pretrained_checkpoint = self.config.trainer.get(
+                "intent_pretrained_checkpoint", None
+            )
+            if intent_pretrained_checkpoint:
+                self.model = self.load_pretrained_backbones(
+                    self.model,
+                    intent_pretrained_checkpoint,
+                    reload_modules="intent_head",
+                )
+                logger.info(
+                    "Overlayed pretrained Intent branch from "
+                    f"{intent_pretrained_checkpoint}"
+                )
             self.completed_steps = 0
             self.resume_from_checkpoint = pretrained_checkpoint
             logger.info(f"Loaded pretrained checkpoint: {pretrained_checkpoint}, steps: {self.completed_steps}")
@@ -353,7 +486,10 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            if (
+                bool(self.config.trainer.get("enable_action_eval", True))
+                and self.completed_steps % self.config.trainer.eval_interval == 0
+            ):
                 step_metrics = self.eval_action_model(step_metrics)
 
             step_metrics["timing/data"] = t_end_data - t_start_data
@@ -372,9 +508,26 @@ class VLATrainer(TrainerUtils):
         """Run simple action-eval on current batch and attach score to metrics."""
         examples = self._get_next_batch()
         actions = [example["action"] for example in examples]
-        output_dict = self.accelerator.unwrap_model(self.model).predict_action(
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        output_dict = unwrapped_model.predict_action(
             examples=examples, use_ddim=True, num_ddim_steps=20
         )
+
+        enable_intent_probe = bool(
+            self.config.trainer.get("enable_intent_condition_probe", False)
+        )
+        probe_metrics = {}
+        if enable_intent_probe and hasattr(unwrapped_model, "diagnose_intent_condition"):
+            probe_seed = int(
+                self.config.trainer.get(
+                    "intent_condition_probe_seed",
+                    getattr(self.config, "seed", 42),
+                )
+            )
+            probe_metrics = unwrapped_model.diagnose_intent_condition(
+                examples=examples,
+                probe_seed=probe_seed,
+            )
 
         if self.accelerator.is_main_process:
             normalized_actions = output_dict["normalized_actions"]
@@ -382,6 +535,9 @@ class VLATrainer(TrainerUtils):
             num_pots = np.prod(actions.shape)
             score = TrainerUtils.euclidean_distance(normalized_actions, actions)
             step_metrics["mse_score"] = score / num_pots
+            for metric_name, value in probe_metrics.items():
+                if isinstance(value, torch.Tensor) and value.numel() == 1:
+                    step_metrics[metric_name] = value.detach().item()
 
         del examples
         dist.barrier()
@@ -398,15 +554,34 @@ class VLATrainer(TrainerUtils):
 
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
+        will_log = (
+            (self.completed_steps + 1)
+            % int(self.config.trainer.logging_frequency)
+            == 0
+        )
         with self.accelerator.accumulate(self.model):
             self.optimizer.zero_grad()
+
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            if hasattr(unwrapped_model, "set_training_step"):
+                unwrapped_model.set_training_step(self.completed_steps)
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+                # E1 frameworks return the already-composed 4.1 objective.
+                # Existing frameworks keep their original action-only behavior.
+                total_loss = output_dict.get("total_loss", action_loss)
 
             self.accelerator.backward(total_loss)
+
+            # E1 connectivity diagnostics are captured before global clipping
+            # and optimizer.step(), while parameter gradients are still present.
+            gradient_metrics = {}
+            if will_log:
+                gradient_metrics = self._collect_intent_gradient_metrics(
+                    unwrapped_model
+                )
 
             if self.config.trainer.gradient_clipping is not None:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
@@ -420,9 +595,68 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
-        return {
-            "action_dit_loss": action_loss.item(),
+        metrics = {
+            "action_dit_loss": self._metric_scalar(action_loss, aggregate=will_log),
+            "total_loss": self._metric_scalar(total_loss, aggregate=will_log),
+            "loss/intent_contribution": self._metric_scalar(
+                total_loss.detach() - action_loss.detach(), aggregate=will_log
+            ),
         }
+        metrics.update(
+            {
+                name: self._metric_scalar(value, aggregate=will_log)
+                for name, value in gradient_metrics.items()
+            }
+        )
+        optional_metric_names = {
+            "intent_loss": "intent_ce",
+            "weighted_intent_loss": "weighted_intent_loss",
+            "intent_top1_accuracy": "intent_top1_accuracy",
+            "intent_top5_accuracy": "intent_top5_accuracy",
+            "intent_probability_entropy": "intent/probability_entropy",
+            "intent_max_probability": "intent/max_probability",
+            "intent_condition_l2_mean": "intent_condition/l2_mean",
+            "intent_condition_abs_mean": "intent_condition/abs_mean",
+            "intent_to_timestep_weight_norm": "intent_to_timestep/weight_norm",
+            "timestep_embedding_l2_mean": "timestep_embedding/l2_mean",
+            "joint_timestep_condition_l2_mean": "joint_timestep_condition/l2_mean",
+            "intent_condition_to_timestep_l2_ratio": "intent_condition/to_timestep_l2_ratio",
+            "intent_training_stage_id": "intent/training_stage_id",
+            "intent_global_feature_l2_mean": "intent/global_feature_l2_mean",
+            "intent_token_attention_residual_ratio": "intent/token_attention_residual_ratio",
+            "intent_token_ffn_residual_ratio": "intent/token_ffn_residual_ratio",
+            "intent_layer_attention_residual_ratio": "intent/layer_attention_residual_ratio",
+            "intent_layer_ffn_residual_ratio": "intent/layer_ffn_residual_ratio",
+            "intent_token_summary_pre_norm_l2_mean": "intent/token_summary_pre_norm_l2_mean",
+            "intent_token_summary_post_norm_l2_mean": "intent/token_summary_post_norm_l2_mean",
+            "intent_global_feature_pre_norm_l2_mean": "intent/global_feature_pre_norm_l2_mean",
+            "intent_global_feature_post_norm_l2_mean": "intent/global_feature_post_norm_l2_mean",
+            "intent_layer_attention_entropy": "intent/layer_attention_entropy",
+            "query_film_delta_gamma_rms_mean": "query_film/delta_gamma_rms_mean",
+            "query_film_delta_beta_rms_mean": "query_film/delta_beta_rms_mean",
+            "query_film_modulation_to_query_l2_ratio_mean": "query_film/modulation_to_query_l2_ratio_mean",
+            "ffn_film_delta_gamma_rms_mean": "ffn_film/delta_gamma_rms_mean",
+            "ffn_film_delta_beta_rms_mean": "ffn_film/delta_beta_rms_mean",
+            "ffn_film_modulation_to_input_l2_ratio_mean": "ffn_film/modulation_to_input_l2_ratio_mean",
+        }
+        for output_name, metric_name in optional_metric_names.items():
+            value = output_dict.get(output_name)
+            if isinstance(value, torch.Tensor) and value.numel() == 1:
+                metrics[metric_name] = self._metric_scalar(
+                    value, aggregate=will_log
+                )
+        for output_name, value in output_dict.items():
+            if output_name.startswith("intent_layer_attention_weight_"):
+                layer = output_name.rsplit("_", 1)[-1]
+                metrics[f"intent/layer_attention_weight_{layer}"] = self._metric_scalar(
+                    value, aggregate=will_log
+                )
+            elif output_name.startswith("intent_token_attention_entropy_"):
+                layer = output_name.rsplit("_", 1)[-1]
+                metrics[f"intent/token_attention_entropy_{layer}"] = self._metric_scalar(
+                    value, aggregate=will_log
+                )
+        return metrics
 
     def _finalize_training(self):
         """Training end processing."""

@@ -366,6 +366,13 @@ DATASET_NAMED_MIXTURES = {
     "calvin_abc_d_sixpigs_rel_scaled": [
         ("sixpigs1_calvin2lerobotV21_ABC_D_scnet_rel_calvin_scaled", 1.0, "libero_franka"),
     ],
+    "calvin_abc_d_sixpigs_rel_scaled_intent125_h8": [
+        (
+            "sixpigs1_calvin2lerobotV21_ABC_D_scnet_rel_calvin_scaled_intent125_h8",
+            1.0,
+            "libero_franka",
+        ),
+    ],
     "vla_arena_L0_S": [
         ("VLA_Arena_L0_S_lerobot_openpi", 1.0, "vla_arena_franka"),
     ],

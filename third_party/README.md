@@ -26,6 +26,15 @@ The StarVLA snapshot contains only the local changes required by this baseline:
 - `starVLA/dataloader/gr00t_lerobot/mixtures.py`: registration of
   `calvin_abc_d_sixpigs_rel_scaled`.
 
+## Local E1 Intent extensions applied to StarVLA
+
+The snapshot also contains the configurable E1 Intent family used by this
+project: E1-B timestep conditioning, E1-C FFN-FiLM, and the Spatial Intent v2
+hierarchical Query Transformer with Query/FFN-FiLM. The implementation,
+training/evaluation configs, and CPU tests live inside `third_party/starvla`;
+the server launch and dataset-label utilities live in
+`scripts/e1_abc_intent/` at the parent-repository level.
+
 Machine-specific shell defaults, downloaded models, datasets, checkpoints,
 playground symlinks, caches and unrelated dirty working-tree files were not
 copied into this snapshot.

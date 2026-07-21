@@ -1,0 +1,135 @@
+# E1 Spatial Intent Stage 0: train only the multi-layer Intent branch with CE.
+# This is pretraining compute and is intentionally separate from the 90k-step
+# matched E0 comparison budget used by the S1/S2 main run.
+run_id: e1_spatial_intent_s0_30k
+run_root_dir: /home/data/models/kehang-StarVLA/checkpoints/calvin
+seed: 42
+wandb_entity: disabled
+wandb_project: starVLA_Calvin_E1_Spatial_Intent_S0
+is_debug: false
+version_id: "e1_spatial_intent_s0_v1"
+
+framework:
+  name: QwenPIIntent_v3
+
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2048
+
+  action_model:
+    action_model_type: DiT-B
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 7
+    state_dim: 7
+    action_horizon: 8
+    repeated_diffusion_steps: 16
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+
+    diffusion_model_cfg:
+      action_dit_hidden_dim: 1024
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+      attention_head_dim: 64
+
+  intent:
+    training_stage: s0
+    use_multilayer_aggregator: true
+    source_layers: [4, 8, 12, 16, 20, 24, 28, 32, 36]
+    initialize_projectors_from_action: true
+    use_layer_position_embedding: true
+    return_attention_diagnostics: true
+    attention_diagnostics_interval: 100
+
+    use_aux_loss: true
+    add_to_timestep_embedding: false
+    use_ffn_film: false
+    use_cross_attn_query_film: false
+    # S0 uses raw CE regardless; keep this value aligned with S2 metadata.
+    loss_weight: 0.1
+    hidden_size: 1024
+    num_attention_heads: 16
+    classifier_hidden_size: 512
+    num_classes: 125
+    dropout: 0.1
+    pooler_type: learned_query
+
+datasets:
+  vlm_data:
+    dataset_py: vlm_datasets
+    dataformat: llava_json
+    dataset_use: sharegpt4v_coco
+    eval_dataset: sharegpt4v_coco
+    data_flatten: false
+    base_interval: 2
+    max_pixels: 307200
+    min_pixels: 784
+    model_max_length: 2048
+    model_type: qwen3.vl
+    per_device_batch_size: 4
+
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: false
+    include_intent: true
+    intent_class_column: intent.class_id
+    intent_num_classes: 125
+    data_root_dir: /home/data/datasets/kehang-CALVIN/calvin/lerobot
+    data_mix: calvin_abc_d_sixpigs_rel_scaled_intent125_h8
+    action_mode: abs
+    action_type: calvin_scaled_rel_actions
+    CoT_prompt: "Your task is {instruction}."
+    # S0 skips Action DiT/repeated diffusion, so use a larger Intent batch to
+    # reduce the high per-batch CE/accuracy variance observed in E1-B.
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+
+trainer:
+  max_train_steps: 45000
+  num_warmup_steps: 3000
+  save_interval: 5000
+  eval_interval: 1000
+  enable_action_eval: false
+  repeated_diffusion_steps: 16
+
+  learning_rate:
+    base: 2.5e-05
+    intent_head.project_layers: 5.0e-05
+    intent_head.token_attention: 1.0e-04
+    intent_head.layer_attention: 1.0e-04
+    intent_head.classifier: 1.0e-04
+    intent_head: 1.0e-04
+
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+
+  # S0 updates only intent_head. Action projectors remain available for the
+  # one-time value copy but are excluded from the optimizer and then frozen.
+  freeze_modules: qwen_vl_interface,action_model,project_layers,intent_to_timestep
+  loss_scale:
+    vla: 1.0
+    vlm: 0.0
+
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 20
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

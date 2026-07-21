@@ -244,9 +244,20 @@ class Qwen_PI_v3(baseframework):
         return [proj(vl_h) for proj, vl_h in zip(self.project_layers, vl_embs_list)]
 
     def _encode_vl_hidden_states(
-        self, batch_images: List, instructions: List[str]
+        self,
+        batch_images: List,
+        instructions: List[str],
+        *,
+        return_unprojected: bool = False,
+        project_for_action: bool = True,
     ) -> tuple:
-        """Run QwenVL, project hidden states, and return (layer-wise embeddings, attention_mask) for the Action DiT."""
+        """Run QwenVL once and optionally expose the raw layer-wise states.
+
+        Existing callers receive the original ``(projected, attention_mask)``
+        pair.  The multi-layer Intent branch additionally requests the raw VLM
+        states so its dedicated projectors never share parameters with the
+        Action projectors.  S0 can skip Action projection entirely.
+        """
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
             images=batch_images, instructions=instructions
         )
@@ -258,8 +269,16 @@ class Qwen_PI_v3(baseframework):
                 output_hidden_states=True,
                 return_dict=True,
             )
-            vl_embs_list = list(qwenvl_outputs.hidden_states[-self.num_action_dit_layers:])
-            vl_embs_list = self._project_vl_hidden_for_action(vl_embs_list)
+            raw_vl_embs_list = list(
+                qwenvl_outputs.hidden_states[-self.num_action_dit_layers :]
+            )
+            vl_embs_list = (
+                self._project_vl_hidden_for_action(raw_vl_embs_list)
+                if project_for_action
+                else None
+            )
+        if return_unprojected:
+            return vl_embs_list, attention_mask, raw_vl_embs_list
         return vl_embs_list, attention_mask
 
     def forward(

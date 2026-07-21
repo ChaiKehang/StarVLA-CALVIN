@@ -1413,6 +1413,13 @@ class LeRobotSingleDataset(Dataset):
                 state = np.concatenate(state, axis=1).astype(np.float16)
                 sample["state"] = state
 
+        # E1 CALVIN intent supervision is an opt-in scalar parquet column.  It
+        # is deliberately kept outside the generic language annotation path:
+        # get_language() interprets numeric annotation values as task-table
+        # indices, while intent.class_id is already the final class target.
+        if "intent_class_id" in data:
+            sample["intent_class_id"] = int(data["intent_class_id"])
+
         return sample
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
@@ -1449,6 +1456,28 @@ class LeRobotSingleDataset(Dataset):
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
+
+        if self.data_cfg is not None and self.data_cfg.get("include_intent", False) not in ["False", False]:
+            intent_column = self.data_cfg.get("intent_class_column", "intent.class_id")
+            if intent_column not in self.curr_traj_data.columns:
+                raise KeyError(
+                    f"include_intent=True but parquet column {intent_column!r} is missing from "
+                    f"dataset {self.dataset_name!r}"
+                )
+
+            raw_intent = np.asarray(self.curr_traj_data[intent_column].iloc[base_index])
+            if raw_intent.size != 1:
+                raise ValueError(
+                    f"Expected scalar intent class in {intent_column!r}, got shape {raw_intent.shape}"
+                )
+            intent_class_id = int(raw_intent.reshape(-1)[0])
+            intent_num_classes = int(self.data_cfg.get("intent_num_classes", 125))
+            if not 0 <= intent_class_id < intent_num_classes:
+                raise ValueError(
+                    f"intent class must be in [0, {intent_num_classes - 1}], got {intent_class_id}"
+                )
+            data["intent_class_id"] = intent_class_id
+
         data = self._apply_action_mode(data)
         return data
 

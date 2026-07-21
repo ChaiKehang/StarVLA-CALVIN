@@ -115,7 +115,20 @@ class PolicyServerWrapper:
             "action_chunk_size": self._action_chunk_size,
             "available_unnorm_keys": self._available_unnorm_keys,
             "default_unnorm_key": self._default_unnorm_key,
+            "framework_name": self._model_cfg.get("framework", {}).get("name"),
         }
+        intent_cfg = self._model_cfg.get("framework", {}).get("intent", {})
+        if intent_cfg:
+            base["intent_conditioning"] = {
+                "num_classes": int(intent_cfg.get("num_classes", 125)),
+                "add_to_timestep_embedding": bool(
+                    intent_cfg.get("add_to_timestep_embedding", False)
+                ),
+                "use_ffn_film": bool(intent_cfg.get("use_ffn_film", False)),
+                "use_cross_attn_query_film": bool(
+                    intent_cfg.get("use_cross_attn_query_film", False)
+                ),
+            }
         # Enrich with per-embodiment keys when a default processor already exists.
         if self._default_unnorm_key is not None:
             proc = self._get_processor(self._default_unnorm_key)
@@ -159,4 +172,7 @@ class PolicyServerWrapper:
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
-        return {"actions": unnorm}
+        response = {"actions": unnorm}
+        if "intent_predictions" in out:
+            response["intent_predictions"] = out["intent_predictions"]
+        return response

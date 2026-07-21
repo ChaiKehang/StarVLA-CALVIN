@@ -88,6 +88,8 @@ class Args:
     eval_log_dir: str = "tmp/calvin/eval_logs"  # Path to save evaluation logs and videos
     reset: bool = False  # If True, reset robot state between tasks (easier)
     diverse_inst: bool = False  # Use diverse instructions (zero-shot generalization)
+    disable_intent_conditioning: bool = False  # Paired E1-B causal ablation
+    inference_seed: int = 42  # Reuse diffusion noise for on/off comparisons
 
 
 class CalvinPolicyClient:
@@ -101,6 +103,8 @@ class CalvinPolicyClient:
         replan_steps: int = 5,
         pretrained_path: str = "",
         unnorm_key: str = "",
+        disable_intent_conditioning: bool = False,
+        inference_seed: int = 42,
     ):
         self.client = ModelClient(
             host=host,
@@ -108,13 +112,148 @@ class CalvinPolicyClient:
             image_size=[resize_size, resize_size],
             unnorm_key=(unnorm_key or None),
         )
+        server_checkpoint = self.client._server_metadata.get("ckpt_path")
+        if pretrained_path and server_checkpoint:
+            expected = Path(pretrained_path).resolve()
+            actual = Path(server_checkpoint).resolve()
+            if expected != actual:
+                raise ValueError(
+                    "CALVIN client/server checkpoint mismatch: "
+                    f"client requested {expected}, server loaded {actual}"
+                )
+        logger.info(
+            "Policy server Intent configuration: %s",
+            self.client._server_metadata.get("intent_conditioning", "not present"),
+        )
         self.resize_size = resize_size
         self.replan_steps = replan_steps
         self.step_count = 0
+        self.disable_intent_conditioning = disable_intent_conditioning
+        self.inference_seed = inference_seed
+        self.intent_records = []
+        self._current_intent_record_start = 0
+        self._current_subtask_context = {}
 
     def reset(self):
         """Reset action plan buffer."""
         self.step_count = 0
+
+    def begin_subtask(self, sequence_i: int, subtask_i: int, subtask: str) -> None:
+        self._current_intent_record_start = len(self.intent_records)
+        self._current_subtask_context = {
+            "sequence_index": int(sequence_i),
+            "subtask_index": int(subtask_i),
+            "subtask": subtask,
+        }
+
+    def finish_subtask(self, success: bool, executed_steps: int) -> None:
+        for record in self.intent_records[self._current_intent_record_start :]:
+            record["subtask_success"] = bool(success)
+            record["subtask_executed_steps"] = int(executed_steps)
+
+    @staticmethod
+    def _axis_bins(displacement_xyz: np.ndarray) -> np.ndarray:
+        """Approximate the training label bins from a predicted action chunk."""
+
+        q20 = 0.0038118734955787693
+        q60 = 0.020136535167694092
+        bins = np.full(3, 2, dtype=np.int64)
+        bins[displacement_xyz < -q60] = 0
+        bins[(displacement_xyz >= -q60) & (displacement_xyz < -q20)] = 1
+        bins[(displacement_xyz >= q20) & (displacement_xyz < q60)] = 3
+        bins[displacement_xyz >= q60] = 4
+        return bins
+
+    def _record_intent_prediction(self, model_output: dict) -> None:
+        if not model_output.get("intent_refreshed", False):
+            return
+        prediction = model_output.get("intent_predictions")
+        if not prediction:
+            return
+
+        def first(name):
+            value = np.asarray(prediction[name])
+            return value[0]
+
+        predicted_class = int(first("predicted_class_id"))
+        predicted_bins = np.asarray(first("predicted_axis_bins"), dtype=np.int64)
+        # Server actions use CALVIN-scaled relative XYZ. Dividing by 50 and
+        # summing the chunk approximates the label builder's meter displacement.
+        action_displacement = np.asarray(self.client.raw_actions[:, :3]).sum(axis=0) / 50.0
+        action_bins = self._axis_bins(action_displacement)
+        action_class = int(25 * action_bins[0] + 5 * action_bins[1] + action_bins[2])
+        self.intent_records.append(
+            {
+                **self._current_subtask_context,
+                "environment_step": int(self.step_count),
+                "predicted_class_id": predicted_class,
+                "predicted_axis_bins": predicted_bins.tolist(),
+                "top5_class_ids": np.asarray(first("top5_class_ids"), dtype=np.int64).tolist(),
+                "top5_probabilities": np.asarray(first("top5_probabilities"), dtype=float).tolist(),
+                "entropy": float(first("entropy")),
+                "max_probability": float(first("max_probability")),
+                "conditioning_applied": bool(first("conditioning_applied")),
+                "action_implied_class_id_approx": action_class,
+                "action_implied_axis_bins_approx": action_bins.tolist(),
+                "intent_action_exact_class_agreement_approx": bool(
+                    predicted_class == action_class
+                ),
+                "intent_action_axis_agreement_count_approx": int(
+                    np.sum(predicted_bins == action_bins)
+                ),
+            }
+        )
+
+    def save_intent_report(self, eval_log_dir: str) -> None:
+        if not self.intent_records:
+            logger.warning("No Intent predictions were returned by the policy server")
+            return
+        log_dir = Path(eval_log_dir)
+        records_path = log_dir / "intent_predictions.jsonl"
+        with records_path.open("w", encoding="utf-8") as handle:
+            for record in self.intent_records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        classes = np.asarray(
+            [record["predicted_class_id"] for record in self.intent_records]
+        )
+        summary = {
+            "num_replans": len(self.intent_records),
+            "conditioning_applied": bool(
+                self.intent_records[0]["conditioning_applied"]
+            ),
+            "mean_entropy": float(
+                np.mean([record["entropy"] for record in self.intent_records])
+            ),
+            "mean_max_probability": float(
+                np.mean([record["max_probability"] for record in self.intent_records])
+            ),
+            "unique_predicted_classes": int(len(np.unique(classes))),
+            "predicted_class_counts": np.bincount(classes, minlength=125).tolist(),
+            "intent_action_exact_class_agreement_approx": float(
+                np.mean(
+                    [
+                        record["intent_action_exact_class_agreement_approx"]
+                        for record in self.intent_records
+                    ]
+                )
+            ),
+            "intent_action_mean_axis_agreement_count_approx": float(
+                np.mean(
+                    [
+                        record["intent_action_axis_agreement_count_approx"]
+                        for record in self.intent_records
+                    ]
+                )
+            ),
+            "note": (
+                "CALVIN rollouts have no expert future-action Intent labels. "
+                "Agreement with the policy action chunk is a consistency metric, not classification accuracy."
+            ),
+        }
+        (log_dir / "intent_summary.json").write_text(
+            json.dumps(summary, indent=2), encoding="utf-8"
+        )
 
     def step(self, obs: dict, lang_annotation: str) -> np.ndarray:
         """
@@ -147,7 +286,13 @@ class CalvinPolicyClient:
         }
 
         # Query model
-        model_output = self.client.step(example=example, step=self.step_count)
+        model_output = self.client.step(
+            example=example,
+            step=self.step_count,
+            disable_intent_conditioning=self.disable_intent_conditioning,
+            inference_seed=self.inference_seed,
+        )
+        self._record_intent_prediction(model_output)
         raw_action = model_output["raw_action"]
         world_vector = np.asarray(raw_action.get("world_vector"), dtype=np.float32).reshape(-1)
         rotation_delta = np.asarray(raw_action.get("rotation_delta"), dtype=np.float32).reshape(-1)
@@ -284,6 +429,8 @@ def evaluate_policy_ddp(
     eval_sequences = extract_iter_from_tqdm(eval_sequences)
 
     print_and_save(results, eval_sequences, eval_log_dir, epoch)
+    if hasattr(policy, "save_intent_report"):
+        policy.save_intent_report(eval_log_dir)
 
     return results
 
@@ -386,6 +533,8 @@ def rollout(
     if "\u2019" in lang_annotation:
         lang_annotation.replace("\u2019", "'")
     policy.reset()
+    if hasattr(policy, "begin_subtask"):
+        policy.begin_subtask(sequence_i, subtask_i, subtask)
     start_info = env.get_info()
 
     if debug:
@@ -411,11 +560,15 @@ def rollout(
         # check if current step solves a task
         current_task_info = task_oracle.get_task_info_for_set(start_info, current_info, {subtask})
         if len(current_task_info) > 0:
+            if hasattr(policy, "finish_subtask"):
+                policy.finish_subtask(True, step + 1)
             if debug:
                 print(colored("success", "green"), end=" ")
                 img_clip = ImageSequenceClip(img_queue, fps=30)
                 img_clip.write_gif(os.path.join(eval_log_dir, f"{sequence_i}-{subtask_i}-{subtask}-succ.gif"), fps=30)
             return True
+    if hasattr(policy, "finish_subtask"):
+        policy.finish_subtask(False, EP_LEN)
     if debug:
         print(colored("fail", "red"), end=" ")
         img_clip = ImageSequenceClip(img_queue, fps=30)
@@ -433,6 +586,8 @@ def main(args: Args):
         args.replan_steps,
         pretrained_path=args.pretrained_path,
         unnorm_key=args.unnorm_key,
+        disable_intent_conditioning=args.disable_intent_conditioning,
+        inference_seed=args.inference_seed,
     )
     env = make_env(args.dataset_path)
 

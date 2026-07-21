@@ -291,6 +291,10 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         actions: torch.Tensor,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
+        intent_condition: torch.Tensor = None,
+        ffn_intent_probabilities: torch.Tensor = None,
+        cross_attn_query_intent_probabilities: torch.Tensor = None,
+        return_condition_diagnostics: bool = False,
     ):
         """
         vl_embs: list of torch.Tensor, each shape (B, seq_length, feature_dim)
@@ -336,7 +340,14 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             timestep=t_discretized,
             encoder_attention_mask=encoder_attention_mask,
             return_pre_output=True,
+            intent_condition=intent_condition,
+            ffn_intent_probabilities=ffn_intent_probabilities,
+            cross_attn_query_intent_probabilities=cross_attn_query_intent_probabilities,
+            return_condition_diagnostics=return_condition_diagnostics,
         )
+        condition_diagnostics = {}
+        if return_condition_diagnostics:
+            model_output, condition_diagnostics = model_output
 
         # Decode only the action-token positions.
         pred = self.action_decoder(model_output)
@@ -344,6 +355,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         loss = ((pred_actions - velocity) ** 2).mean()
+        if return_condition_diagnostics:
+            return loss, condition_diagnostics
         return loss
 
     @torch.no_grad()
@@ -352,6 +365,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         vl_embs_list: list,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
+        intent_condition: torch.Tensor = None,
+        ffn_intent_probabilities: torch.Tensor = None,
+        cross_attn_query_intent_probabilities: torch.Tensor = None,
     ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs_list[0].shape[0]
@@ -398,6 +414,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 timestep=timesteps_tensor,
                 encoder_attention_mask=encoder_attention_mask,
                 return_pre_output=True,
+                intent_condition=intent_condition,
+                ffn_intent_probabilities=ffn_intent_probabilities,
+                cross_attn_query_intent_probabilities=cross_attn_query_intent_probabilities,
             )
             # Decode only the action-token positions.
             pred = self.action_decoder(model_output)
@@ -417,6 +436,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         suffix_length: int | None = None,
         prefix_attention_schedule: str = "exp",
         max_guidance_weight: float = 10.0,
+        intent_condition: torch.Tensor = None,
+        ffn_intent_probabilities: torch.Tensor = None,
+        cross_attn_query_intent_probabilities: torch.Tensor = None,
     ) -> torch.Tensor:
         """RTC-aware flow-matching inference.
 
@@ -443,7 +465,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             actions: (B, action_horizon, action_dim) predicted actions.
         """
         if prev_action_chunk is None or inference_delay <= 0:
-            return self.predict_action(vl_embs_list, state)
+            return self.predict_action(
+                vl_embs_list,
+                state,
+                intent_condition=intent_condition,
+                ffn_intent_probabilities=ffn_intent_probabilities,
+                cross_attn_query_intent_probabilities=cross_attn_query_intent_probabilities,
+            )
 
         import math
 
@@ -486,6 +514,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 encoder_hidden_states=vl_embs_list,
                 timestep=timesteps,
                 return_pre_output=True,
+                intent_condition=intent_condition,
+                ffn_intent_probabilities=ffn_intent_probabilities,
+                cross_attn_query_intent_probabilities=cross_attn_query_intent_probabilities,
             )
             pred = self.action_decoder(model_output)
             return pred[:, -self.action_horizon :]
@@ -612,6 +643,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                     encoder_hidden_states=vl_embs_list,
                     timestep=temb_tensor,
                     return_pre_output=True,
+                    intent_condition=intent_condition,
+                    ffn_intent_probabilities=ffn_intent_probabilities,
+                    cross_attn_query_intent_probabilities=cross_attn_query_intent_probabilities,
                 )
 
                 pred = self.action_decoder(model_output)
