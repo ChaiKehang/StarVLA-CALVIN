@@ -86,7 +86,7 @@ echo "Data: ${LEROBOT_ROOT}"
 echo "Base VLM: ${BASE_VLM}"
 echo "Initialization checkpoint: ${PRETRAINED_CHECKPOINT}"
 echo "Output: ${TARGET_RUN_DIR}"
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3}"
 echo "Processes=${NUM_PROCESSES}, per-device batch=${PER_DEVICE_BATCH_SIZE}"
 
 cd "${STARVLA_DIR}"

@@ -4,7 +4,10 @@ import unittest
 
 import torch
 
-from starVLA.model.modules.action_model.flow_matching_head.cross_attention_dit import DiT
+from starVLA.model.modules.action_model.flow_matching_head.cross_attention_dit import (
+    DiT,
+    IntentFiLMMLP,
+)
 
 
 class DiTIntentConditioningTest(unittest.TestCase):
@@ -172,6 +175,122 @@ class DiTIntentConditioningTest(unittest.TestCase):
         self.model.enable_cross_attn_query_intent_film(num_intent_classes=5)
         with self.assertRaisesRegex(ValueError, "probabilities were not provided"):
             self._forward()
+
+    def test_mlp_film_uses_independent_256d_zero_initialized_projectors(self):
+        output_before_enable = self._forward()
+        self.model.enable_ffn_intent_film(
+            num_intent_classes=5,
+            projector_type="mlp",
+            hidden_dim=256,
+        )
+        self.model.enable_cross_attn_query_intent_film(
+            num_intent_classes=5,
+            projector_type="mlp",
+            hidden_dim=256,
+        )
+        probabilities = torch.softmax(torch.randn(2, 5), dim=-1)
+        output_at_zero = self.model(
+            hidden_states=self.hidden_states,
+            encoder_hidden_states=self.encoder_hidden_states,
+            timestep=self.timesteps,
+            return_pre_output=True,
+            ffn_intent_probabilities=probabilities,
+            cross_attn_query_intent_probabilities=probabilities,
+        )
+
+        ffn_projectors = [
+            block.ffn_intent_film for block in self.model.transformer_blocks
+        ]
+        self.assertEqual(len({id(module) for module in ffn_projectors}), 2)
+        for module in ffn_projectors:
+            self.assertIsInstance(module, IntentFiLMMLP)
+            self.assertEqual(module.in_features, 5)
+            self.assertEqual(module.hidden_features, 256)
+            self.assertEqual(module.out_features, 16)
+            self.assertIsInstance(module.activation, torch.nn.SiLU)
+            self.assertIsInstance(module.norm, torch.nn.LayerNorm)
+            self.assertIsNone(module.output_proj.bias)
+            torch.testing.assert_close(
+                module.output_proj.weight,
+                torch.zeros_like(module.output_proj.weight),
+            )
+
+        query_projector = self.model.transformer_blocks[0].cross_attn_query_intent_film
+        self.assertIsInstance(query_projector, IntentFiLMMLP)
+        self.assertEqual(query_projector.hidden_features, 256)
+        self.assertIsNone(
+            self.model.transformer_blocks[1].cross_attn_query_intent_film
+        )
+        self.assertNotEqual(id(query_projector), id(ffn_projectors[0]))
+        torch.testing.assert_close(output_before_enable, output_at_zero)
+
+        torch.nn.init.normal_(ffn_projectors[0].output_proj.weight)
+        output_after_update = self.model(
+            hidden_states=self.hidden_states,
+            encoder_hidden_states=self.encoder_hidden_states,
+            timestep=self.timesteps,
+            return_pre_output=True,
+            ffn_intent_probabilities=probabilities,
+            cross_attn_query_intent_probabilities=probabilities,
+        )
+        self.assertFalse(torch.allclose(output_at_zero, output_after_update))
+
+    def test_factorized_router_is_zero_initialized_bounded_and_maskable(self):
+        output_before = self._forward()
+        self.model.enable_cross_attn_query_intent_film(
+            num_intent_classes=255,
+            projector_type="mlp",
+            hidden_dim=512,
+            layer_numbers=[1],
+            output_bias=True,
+            modulation_bound=0.2,
+        )
+        probabilities = torch.cat(
+            [
+                torch.softmax(torch.randn(2, 125), dim=-1),
+                torch.softmax(torch.randn(2, 125), dim=-1),
+                torch.softmax(torch.randn(2, 5), dim=-1),
+            ],
+            dim=-1,
+        )
+        router = self.model.transformer_blocks[0].cross_attn_query_intent_film
+        self.assertEqual(router.in_features, 255)
+        self.assertEqual(router.hidden_features, 512)
+        self.assertIsNotNone(router.output_proj.bias)
+        torch.testing.assert_close(
+            router.output_proj.weight, torch.zeros_like(router.output_proj.weight)
+        )
+        torch.testing.assert_close(
+            router.output_proj.bias, torch.zeros_like(router.output_proj.bias)
+        )
+        output_at_zero = self.model(
+            hidden_states=self.hidden_states,
+            encoder_hidden_states=self.encoder_hidden_states,
+            timestep=self.timesteps,
+            return_pre_output=True,
+            cross_attn_query_intent_probabilities=probabilities,
+        )
+        torch.testing.assert_close(output_before, output_at_zero)
+
+        torch.nn.init.normal_(router.output_proj.weight, std=10.0)
+        output_masked, diagnostics = self.model(
+            hidden_states=self.hidden_states,
+            encoder_hidden_states=self.encoder_hidden_states,
+            timestep=self.timesteps,
+            return_pre_output=True,
+            cross_attn_query_intent_probabilities=probabilities,
+            intent_film_sample_mask=torch.zeros(2),
+            return_condition_diagnostics=True,
+        )
+        torch.testing.assert_close(output_before, output_masked)
+        self.assertLessEqual(
+            diagnostics["query_film_bounded_delta_gamma_abs_max_mean"].item(),
+            0.2 + 1.0e-6,
+        )
+        self.assertLessEqual(
+            diagnostics["query_film_bounded_delta_beta_abs_max_mean"].item(),
+            0.2 + 1.0e-6,
+        )
 
 
 if __name__ == "__main__":

@@ -12,10 +12,13 @@ STARVLA_DIR="${STARVLA_DIR:-${PROJECT_ROOT}/third_party/starvla}"
 export CONFIG_YAML="${CONFIG_YAML:-${STARVLA_DIR}/examples/calvin/train_files/e1_spatial_intent_s1_s2_query_ffn_v2_90k.yaml}"
 export S0_STEPS="${S0_STEPS:-60000}"
 export S0_RUN_ID="${S0_RUN_ID:-e1_spatial_intent_query_ffn_v2_s0_${S0_STEPS}}"
-export STAGE1_STEPS="${STAGE1_STEPS:-10000}"
+export S0_INTENT_CHECKPOINT="${S0_INTENT_CHECKPOINT:-/home/data/models/kehang-StarVLA/checkpoints/calvin/e1_spatial_intent_query_ffn_v2_s0_restart40k_20k/checkpoints/steps_20000_pytorch_model.pt}"
+export STAGE1_STEPS="${STAGE1_STEPS:-15000}"
 export MAIN_MAX_STEPS=90000
-export RUN_ID="${RUN_ID:-e1_spatial_intent_query_ffn_v2_s1_s2_90k}"
-export PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-8}"
+export RUN_ID="${RUN_ID:-e1_spatial_intent_query_ffn_v2_s1_15k_s2_75k_90k_bs4_ga2_restart}"
+export PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-4}"
+export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
+export ACCELERATE_CONFIG_FILE="${ACCELERATE_CONFIG_FILE:-${SCRIPT_DIR}/deepspeed/deepspeed_zero2_grad_accum2.yaml}"
 export WANDB_PROJECT="${WANDB_PROJECT:-starVLA_Calvin_E1_Spatial_Intent_Main_V2}"
 
 if (( S0_STEPS < 10000 || S0_STEPS > 70000 )); then

@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 STARVLA_DIR="${STARVLA_DIR:-${PROJECT_ROOT}/third_party/starvla}"
 CONFIG_YAML="${CONFIG_YAML:-${STARVLA_DIR}/examples/calvin/train_files/e1_spatial_intent_s0.yaml}"
+ACCELERATE_BIN="${ACCELERATE_BIN:-/home/liuchang/miniconda3/envs/starvla-e0/bin/accelerate}"
 
 MODEL_ROOT="${MODEL_ROOT:-/home/data/models/kehang-StarVLA}"
 LEROBOT_ROOT="${LEROBOT_ROOT:-/home/data/datasets/kehang-CALVIN/calvin/lerobot}"
@@ -15,8 +16,13 @@ CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${MODEL_ROOT}/checkpoints/calvin}"
 BASE_VLM="${BASE_VLM:-${MODEL_ROOT}/Qwen3-VL-4B-Instruct}"
 PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-${MODEL_ROOT}/pretrained/starvla_qwenpi_pretrain_qwen3_4B_bridge-rt_1/checkpoints/steps_50000_pytorch_model.pt}"
 
-S0_MAX_STEPS="${S0_MAX_STEPS:-60000}"
+S0_MAX_STEPS="${S0_MAX_STEPS:-40000}"
 S0_WARMUP_STEPS="${S0_WARMUP_STEPS:-5000}"
+TRAINER_IS_RESUME="${TRAINER_IS_RESUME:-false}"
+TRAINING_PHASE_ID_OVERRIDE="${TRAINING_PHASE_ID_OVERRIDE:-}"
+WANDB_LOG_AFTER_STEP_OVERRIDE="${WANDB_LOG_AFTER_STEP_OVERRIDE:-}"
+RECOVERED_FROM_PHASE_STEP_OVERRIDE="${RECOVERED_FROM_PHASE_STEP_OVERRIDE:-}"
+WANDB_NAME_OVERRIDE="${WANDB_NAME_OVERRIDE:-}"
 RUN_ID="${RUN_ID:-e1_spatial_intent_s0_${S0_MAX_STEPS}}"
 PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-32}"
 CACHE_ROOT="${CACHE_ROOT:-${PROJECT_ROOT}/.cache}"
@@ -26,6 +32,10 @@ MAX_GPU_MEMORY_MIB="${MAX_GPU_MEMORY_MIB:-49000}"
 
 if (( S0_MAX_STEPS < 10000 || S0_MAX_STEPS > 70000 )); then
   echo "[ERROR] S0_MAX_STEPS must be within [10000, 70000], got ${S0_MAX_STEPS}." >&2
+  exit 2
+fi
+if [[ "${TRAINER_IS_RESUME}" != "true" && "${TRAINER_IS_RESUME}" != "false" ]]; then
+  echo "[ERROR] TRAINER_IS_RESUME must be true or false, got ${TRAINER_IS_RESUME}." >&2
   exit 2
 fi
 # Respect Slurm's visibility when present. Outside Slurm, default to physical 2,3.
@@ -96,11 +106,23 @@ for required in "${STARVLA_DIR}" "${CONFIG_YAML}" "${LEROBOT_ROOT}" "${BASE_VLM}
     exit 2
   fi
 done
+if [[ ! -x "${ACCELERATE_BIN}" ]]; then
+  echo "[ERROR] accelerate executable not found: ${ACCELERATE_BIN}" >&2
+  exit 2
+fi
 
 TARGET_RUN_DIR="${CHECKPOINT_ROOT}/${RUN_ID}"
 if [[ -d "${TARGET_RUN_DIR}" ]] && [[ -n "$(find "${TARGET_RUN_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
-  echo "[ERROR] ${TARGET_RUN_DIR} already exists and is not empty; choose a new RUN_ID." >&2
-  exit 3
+  if [[ "${TRAINER_IS_RESUME}" == "true" ]]; then
+    if ! find "${TARGET_RUN_DIR}/checkpoints" -maxdepth 1 -type f \
+      -name 'steps_*_pytorch_model.pt' -print -quit 2>/dev/null | rg -q .; then
+      echo "[ERROR] Resume requested but no step checkpoint exists in ${TARGET_RUN_DIR}/checkpoints." >&2
+      exit 3
+    fi
+  else
+    echo "[ERROR] ${TARGET_RUN_DIR} already exists and is not empty; choose a new RUN_ID." >&2
+    exit 3
+  fi
 fi
 
 export WANDB_MODE="${WANDB_MODE:-online}"
@@ -119,17 +141,33 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 mkdir -p "${CHECKPOINT_ROOT}" "${HF_HOME}" "${TORCH_HOME}" \
   "${WANDB_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${XDG_CACHE_HOME}"
 
+TRAINER_OVERRIDES=()
+if [[ -n "${TRAINING_PHASE_ID_OVERRIDE}" ]]; then
+  TRAINER_OVERRIDES+=(--trainer.training_phase_id "${TRAINING_PHASE_ID_OVERRIDE}")
+fi
+if [[ -n "${WANDB_LOG_AFTER_STEP_OVERRIDE}" ]]; then
+  TRAINER_OVERRIDES+=(--trainer.wandb_log_after_step "${WANDB_LOG_AFTER_STEP_OVERRIDE}")
+fi
+if [[ -n "${RECOVERED_FROM_PHASE_STEP_OVERRIDE}" ]]; then
+  TRAINER_OVERRIDES+=(--trainer.recovered_from_phase_step "${RECOVERED_FROM_PHASE_STEP_OVERRIDE}")
+fi
+if [[ -n "${WANDB_NAME_OVERRIDE}" ]]; then
+  TRAINER_OVERRIDES+=(--wandb_name "${WANDB_NAME_OVERRIDE}")
+fi
+
 echo "Stage=S0 Intent-only CE"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "Processes=${NUM_PROCESSES} (maximum 2), watchdog GPUs=${WATCHDOG_GPUS}"
+echo "Accelerate=${ACCELERATE_BIN}"
 echo "Accelerate main process port=${MAIN_PROCESS_PORT}"
 echo "Config=${CONFIG_YAML}"
 echo "Base checkpoint=${PRETRAINED_CHECKPOINT}"
 echo "Output=${TARGET_RUN_DIR}"
+echo "Trainer resume=${TRAINER_IS_RESUME}"
 echo "Steps=${S0_MAX_STEPS}, warmup=${S0_WARMUP_STEPS}, per-device batch=${PER_DEVICE_BATCH_SIZE}"
 
 cd "${STARVLA_DIR}"
-accelerate launch \
+"${ACCELERATE_BIN}" launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
   --num_processes "${NUM_PROCESSES}" \
   --main_process_port "${MAIN_PROCESS_PORT}" \
@@ -139,14 +177,15 @@ accelerate launch \
   --datasets.vla_data.data_root_dir "${LEROBOT_ROOT}" \
   --datasets.vla_data.per_device_batch_size "${PER_DEVICE_BATCH_SIZE}" \
   --trainer.pretrained_checkpoint "${PRETRAINED_CHECKPOINT}" \
-  --trainer.is_resume false \
+  --trainer.is_resume "${TRAINER_IS_RESUME}" \
   --trainer.max_train_steps "${S0_MAX_STEPS}" \
   --trainer.num_warmup_steps "${S0_WARMUP_STEPS}" \
   --trainer.save_interval 5000 \
   --run_root_dir "${CHECKPOINT_ROOT}" \
   --run_id "${RUN_ID}" \
   --wandb_project "${WANDB_PROJECT:-starVLA_Calvin_E1_Spatial_Intent_S0}" \
-  --wandb_entity "${WANDB_ENTITY:-chaikehang-sjtu-hpc-center}" &
+  --wandb_entity "${WANDB_ENTITY:-chaikehang-sjtu-hpc-center}" \
+  "${TRAINER_OVERRIDES[@]}" &
 
 TRAINING_PID=$!
 watchdog "${TRAINING_PID}" &

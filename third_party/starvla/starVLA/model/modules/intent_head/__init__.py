@@ -1,6 +1,8 @@
 """Intent auxiliary-head building blocks for StarVLA E1."""
 
 from .intent_head import (
+    FactorizedIntentHeadOutput,
+    FactorizedMultiLayerIntentClassificationHead,
     IntentAuxiliaryLossOutput,
     IntentClassificationHead,
     IntentHeadConfig,

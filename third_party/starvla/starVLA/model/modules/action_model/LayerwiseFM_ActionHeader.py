@@ -294,6 +294,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         intent_condition: torch.Tensor = None,
         ffn_intent_probabilities: torch.Tensor = None,
         cross_attn_query_intent_probabilities: torch.Tensor = None,
+        intent_film_confidence: torch.Tensor = None,
+        intent_film_sample_mask: torch.Tensor = None,
+        intent_film_scale: float = 1.0,
         return_condition_diagnostics: bool = False,
     ):
         """
@@ -343,6 +346,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             intent_condition=intent_condition,
             ffn_intent_probabilities=ffn_intent_probabilities,
             cross_attn_query_intent_probabilities=cross_attn_query_intent_probabilities,
+            intent_film_confidence=intent_film_confidence,
+            intent_film_sample_mask=intent_film_sample_mask,
+            intent_film_scale=intent_film_scale,
             return_condition_diagnostics=return_condition_diagnostics,
         )
         condition_diagnostics = {}
@@ -368,6 +374,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         intent_condition: torch.Tensor = None,
         ffn_intent_probabilities: torch.Tensor = None,
         cross_attn_query_intent_probabilities: torch.Tensor = None,
+        intent_film_confidence: torch.Tensor = None,
+        intent_film_sample_mask: torch.Tensor = None,
+        intent_film_scale: float = 1.0,
     ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs_list[0].shape[0]
@@ -417,6 +426,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 intent_condition=intent_condition,
                 ffn_intent_probabilities=ffn_intent_probabilities,
                 cross_attn_query_intent_probabilities=cross_attn_query_intent_probabilities,
+                intent_film_confidence=intent_film_confidence,
+                intent_film_sample_mask=intent_film_sample_mask,
+                intent_film_scale=intent_film_scale,
             )
             # Decode only the action-token positions.
             pred = self.action_decoder(model_output)

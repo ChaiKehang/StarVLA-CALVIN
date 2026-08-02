@@ -12,8 +12,11 @@ Conventions:
 
 # Standard Library
 import argparse
+import copy
 import json
 import os
+import re
+import shutil
 import time
 from pathlib import Path
 from typing import Tuple
@@ -48,7 +51,13 @@ from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, w
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
 deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+# The explicit training loop owns scheduler.step().  Keeping this disabled is
+# essential when split_batches=False: AcceleratedScheduler would otherwise
+# advance once per process (twice for the standard two-GPU run).
+accelerator = Accelerator(
+    deepspeed_plugin=deepspeed_plugin,
+    step_scheduler_with_optimizer=False,
+)
 accelerator.print(accelerator.state)
 
 # Sane Defaults
@@ -77,11 +86,31 @@ def setup_directories(cfg) -> Path:
 def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
     """Prepare VLA training data."""
     logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
-    vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
+    vla_train_dataloader = build_dataloader(
+        cfg=cfg,
+        dataset_py=cfg.datasets.vla_data.dataset_py,
+        mode="train",
+    )
+    vla_validation_dataloader = None
+    validation_manifest = cfg.datasets.vla_data.get(
+        "validation_trajectory_manifest", None
+    )
+    if validation_manifest:
+        raw_cfg = cfg.unwrap() if isinstance(cfg, AccessTrackedConfig) else cfg
+        validation_cfg = OmegaConf.create(
+            OmegaConf.to_container(raw_cfg, resolve=True)
+        )
+        validation_cfg.datasets.vla_data.trajectory_manifest = validation_manifest
+        validation_cfg.datasets.vla_data.persistent_workers = False
+        vla_validation_dataloader = build_dataloader(
+            cfg=validation_cfg,
+            dataset_py=validation_cfg.datasets.vla_data.dataset_py,
+            mode="val",
+        )
 
     accelerator.dataloader_config.dispatch_batches = False
     dist.barrier()
-    return vla_train_dataloader
+    return vla_train_dataloader, vla_validation_dataloader
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
@@ -102,11 +131,16 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
     # Strip keys unknown to transformers' get_scheduler before passing kwargs.
     sched_kwargs = {k: v for k, v in cfg.trainer.scheduler_specific_kwargs.items()}
+    scheduler_total_steps = int(
+        cfg.trainer.get("scheduler_total_steps", cfg.trainer.max_train_steps)
+    )
+    if scheduler_total_steps <= 0:
+        raise ValueError("trainer.scheduler_total_steps must be positive")
     lr_scheduler = get_scheduler(
         name=cfg.trainer.lr_scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=cfg.trainer.num_warmup_steps,
-        num_training_steps=cfg.trainer.max_train_steps,
+        num_training_steps=scheduler_total_steps,
         scheduler_specific_kwargs=sched_kwargs,
     )
 
@@ -114,15 +148,32 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
 
 class VLATrainer(TrainerUtils):
-    def __init__(self, cfg, model, vla_train_dataloader, optimizer, lr_scheduler, accelerator):
+    def __init__(
+        self,
+        cfg,
+        model,
+        vla_train_dataloader,
+        optimizer,
+        lr_scheduler,
+        accelerator,
+        vla_validation_dataloader=None,
+    ):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
+        self.vla_validation_dataloader = vla_validation_dataloader
+        self.best_intent_validation_score = float("-inf")
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
+        self._initial_lr_scheduler_state = copy.deepcopy(
+            lr_scheduler.state_dict()
+        )
+        self._scheduler_limit_reported = False
 
         self.completed_steps = 0
+        self._resume_training_state_dir = None
+        self._full_training_state_loaded = False
         self.total_batch_size = self._calculate_total_batch_size()
 
     def prepare_training(self):
@@ -136,7 +187,6 @@ class VLATrainer(TrainerUtils):
         self._save_initial_configs()
 
         self._init_checkpointing()
-        self._adjust_lr_scheduler_for_resume()
 
         freeze_modules = (
             self.config.trainer.freeze_modules
@@ -146,13 +196,28 @@ class VLATrainer(TrainerUtils):
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
         self.print_trainable_parameters(self.model)
 
-        self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
-            self.accelerator,
+        # The scheduler must be prepared as well, otherwise
+        # Accelerator.save_state() cannot persist/restore its exact position.
+        components = [
             self.model,
             self.optimizer,
             self.vla_train_dataloader,
-        )
+            self.lr_scheduler,
+        ]
+        if self.vla_validation_dataloader is not None:
+            components.append(self.vla_validation_dataloader)
+        prepared = self.setup_distributed_training(self.accelerator, *components)
+        (
+            self.model,
+            self.optimizer,
+            self.vla_train_dataloader,
+            self.lr_scheduler,
+        ) = prepared[:4]
+        if self.vla_validation_dataloader is not None:
+            self.vla_validation_dataloader = prepared[4]
 
+        self._restore_full_training_state()
+        self._adjust_lr_scheduler_for_resume()
         self._init_wandb()
 
     def _calculate_total_batch_size(self):
@@ -226,6 +291,18 @@ class VLATrainer(TrainerUtils):
                     "intent_classifier/grad_norm": getattr(
                         intent_head, "classifier", None
                     ),
+                    "intent_layer_query_blocks/grad_norm": getattr(
+                        intent_head, "layer_query_blocks", None
+                    ),
+                    "intent_xyz_classifier/grad_norm": getattr(
+                        intent_head, "xyz_classifier", None
+                    ),
+                    "intent_rpy_classifier/grad_norm": getattr(
+                        intent_head, "rpy_classifier", None
+                    ),
+                    "intent_gripper_classifier/grad_norm": getattr(
+                        intent_head, "gripper_classifier", None
+                    ),
                 }
             )
         action_dit = getattr(getattr(model, "action_model", None), "model", None)
@@ -273,7 +350,7 @@ class VLATrainer(TrainerUtils):
         return scalar.item()
 
     def _init_wandb(self):
-        """Initialize Weights & Biases (best-effort; must not block training)."""
+        """Initialize W&B, with strict failure for an explicitly required resume."""
         self._wandb_enabled = False
         if os.environ.get("WANDB_MODE") == "disabled" or os.environ.get("WANDB_DISABLED", "").lower() in {
             "1",
@@ -284,15 +361,30 @@ class VLATrainer(TrainerUtils):
             return
         if self.accelerator.is_main_process:
             try:
+                wandb_init_kwargs = {}
+                if os.environ.get("WANDB_RUN_ID"):
+                    wandb_init_kwargs["id"] = os.environ["WANDB_RUN_ID"]
+                if os.environ.get("WANDB_RESUME"):
+                    wandb_init_kwargs["resume"] = os.environ["WANDB_RESUME"]
                 wandb.init(
-                    name=self.config.run_id,
+                    name=self.config.get("wandb_name", self.config.run_id),
                     dir=os.path.join(self.config.output_dir, "wandb"),
                     project=self.config.wandb_project,
                     entity=self.config.wandb_entity,
                     group="vla-train",
+                    **wandb_init_kwargs,
                 )
                 self._wandb_enabled = True
             except Exception as exc:
+                wandb_required = os.environ.get(
+                    "WANDB_REQUIRED", ""
+                ).lower() in {"1", "true", "yes"}
+                if (
+                    os.environ.get("WANDB_RESUME", "").lower() == "must"
+                    or wandb_required
+                ):
+                    logger.error(f"Required W&B initialization failed: {exc}")
+                    raise
                 logger.warning(f"W&B init failed; continuing without W&B: {exc}")
                 self._wandb_enabled = False
         # Rendezvous after rank-0 W&B init. Otherwise a slow or failing init on
@@ -325,12 +417,38 @@ class VLATrainer(TrainerUtils):
         """Initialize checkpoint directory and handle checkpoint loading."""
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+        best_metrics_path = Path(self.checkpoint_dir) / "best_intent_metrics.json"
+        if best_metrics_path.exists():
+            best_metrics = json.loads(best_metrics_path.read_text(encoding="utf-8"))
+            self.best_intent_validation_score = float(
+                best_metrics.get("selection_score", float("-inf"))
+            )
 
         pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
         is_resume = getattr(self.config.trainer, "is_resume", False)
         self.resume_from_checkpoint = pretrained_checkpoint
 
         if is_resume:
+            requested_training_state = self.config.trainer.get(
+                "resume_training_state", None
+            )
+            if requested_training_state:
+                resume_state, resume_step = self._validate_training_state_dir(
+                    requested_training_state
+                )
+            else:
+                resume_state, resume_step = self._get_latest_training_state(
+                    self.checkpoint_dir
+                )
+            if resume_state:
+                self._resume_training_state_dir = resume_state
+                self.completed_steps = resume_step
+                logger.info(
+                    "Found complete model/optimizer/scheduler training state: "
+                    f"{resume_state}, steps: {resume_step}"
+                )
+                return
+
             resume_from_checkpoint, self.completed_steps = self._get_latest_checkpoint(self.checkpoint_dir)
             if resume_from_checkpoint:
                 self.resume_from_checkpoint = resume_from_checkpoint
@@ -377,20 +495,252 @@ class VLATrainer(TrainerUtils):
             logger.info("No pretrained checkpoint provided. Starting training from scratch.")
             self.completed_steps = 0
 
+    @staticmethod
+    def _validate_training_state_dir(training_state_dir):
+        """Validate a completed full-state checkpoint and return its saved step."""
+
+        path = Path(training_state_dir).expanduser().resolve()
+        metadata_path = path / "trainer_state.json"
+        if not path.is_dir():
+            raise FileNotFoundError(
+                f"Training-state checkpoint directory does not exist: {path}"
+            )
+        if not metadata_path.is_file():
+            raise RuntimeError(
+                "Training-state checkpoint is incomplete (missing "
+                f"{metadata_path.name}): {path}"
+            )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        completed_steps = int(metadata["completed_steps"])
+        match = re.fullmatch(r"steps_(\d+)_training_state", path.name)
+        if match is None or int(match.group(1)) != completed_steps:
+            raise RuntimeError(
+                "Training-state directory name and metadata step disagree: "
+                f"{path}, completed_steps={completed_steps}"
+            )
+        return str(path), completed_steps
+
+    def _get_latest_training_state(self, checkpoint_dir):
+        """Return the newest complete Accelerator/DeepSpeed training state."""
+
+        root = Path(checkpoint_dir)
+        if not root.is_dir():
+            return None, 0
+        candidates = []
+        for path in root.iterdir():
+            match = re.fullmatch(r"steps_(\d+)_training_state", path.name)
+            if not path.is_dir() or match is None:
+                continue
+            try:
+                validated_path, completed_steps = (
+                    self._validate_training_state_dir(path)
+                )
+            except (FileNotFoundError, KeyError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning(f"Ignoring incomplete training state {path}: {exc}")
+                continue
+            candidates.append((completed_steps, validated_path))
+        if not candidates:
+            return None, 0
+        completed_steps, path = max(candidates, key=lambda item: item[0])
+        return path, completed_steps
+
+    def _restore_full_training_state(self):
+        """Restore model, AdamW, scheduler, dataloader and RNG after prepare()."""
+
+        if self._resume_training_state_dir is None:
+            return
+        metadata_path = (
+            Path(self._resume_training_state_dir) / "trainer_state.json"
+        )
+        saved_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        self.accelerator.load_state(self._resume_training_state_dir)
+        self._full_training_state_loaded = True
+        current_schedule_id = str(
+            self.config.trainer.get("lr_schedule_id", "default")
+        )
+        saved_schedule_id = str(
+            saved_metadata.get("lr_schedule_id", "default")
+        )
+        reset_on_mismatch = bool(
+            self.config.trainer.get(
+                "reset_scheduler_on_schedule_mismatch", False
+            )
+        )
+        if reset_on_mismatch and saved_schedule_id != current_schedule_id:
+            expected_origin = int(
+                self.config.trainer.get(
+                    "scheduler_restart_origin_step", self.completed_steps
+                )
+            )
+            if self.completed_steps != expected_origin:
+                raise RuntimeError(
+                    "Refusing to reset an LR schedule at an unexpected step: "
+                    f"checkpoint={self.completed_steps}, "
+                    f"expected={expected_origin}"
+                )
+            self._reset_lr_scheduler_for_new_schedule()
+            logger.warning(
+                "Reset LR scheduler after schedule-id change: "
+                f"{saved_schedule_id!r} -> {current_schedule_id!r}. "
+                "Model and AdamW moments remain restored."
+            )
+        self.accelerator.print(
+            "✅ Restored full training state at step "
+            f"{self.completed_steps} from {self._resume_training_state_dir}"
+        )
+
+    @staticmethod
+    def _unwrap_lr_scheduler(lr_scheduler):
+        """Return the underlying PyTorch scheduler from Accelerate wrappers."""
+
+        return getattr(lr_scheduler, "scheduler", lr_scheduler)
+
+    def _reset_lr_scheduler_for_new_schedule(self):
+        """Start the configured recovery schedule without resetting AdamW."""
+
+        scheduler = self._unwrap_lr_scheduler(self.lr_scheduler)
+        scheduler.load_state_dict(
+            copy.deepcopy(self._initial_lr_scheduler_state)
+        )
+        current_lrs = list(scheduler.get_last_lr())
+        if len(current_lrs) != len(self.optimizer.param_groups):
+            raise RuntimeError(
+                "Scheduler/optimizer parameter-group count changed during resume"
+            )
+        for optimizer_group, lr in zip(
+            self.optimizer.param_groups, current_lrs
+        ):
+            optimizer_group["lr"] = float(lr)
+        if scheduler.optimizer is not self.optimizer:
+            for optimizer_group, lr in zip(
+                scheduler.optimizer.param_groups, current_lrs
+            ):
+                optimizer_group["lr"] = float(lr)
+        logger.info(
+            "Started replacement LR schedule at local scheduler step %s with "
+            "group LRs %s",
+            scheduler.last_epoch,
+            current_lrs,
+        )
+
+    def _step_lr_scheduler(self):
+        """Advance exactly once and clamp permanently at the schedule endpoint."""
+
+        scheduler = self._unwrap_lr_scheduler(self.lr_scheduler)
+        scheduler_total_steps = int(
+            self.config.trainer.get(
+                "scheduler_total_steps", self.config.trainer.max_train_steps
+            )
+        )
+        if int(scheduler.last_epoch) >= scheduler_total_steps:
+            if not self._scheduler_limit_reported:
+                logger.warning(
+                    "LR scheduler reached its endpoint (%s); holding the "
+                    "final LR instead of entering another cosine half-cycle.",
+                    scheduler_total_steps,
+                )
+                self._scheduler_limit_reported = True
+            return
+        self.lr_scheduler.step()
+
     def _adjust_lr_scheduler_for_resume(self):
-        """Adjust LR scheduler state after resuming from non-zero steps."""
-        if self.completed_steps > 0:
-            logger.info(f"Adjusting LR scheduler for resume from step {self.completed_steps}")
-            for _ in range(self.completed_steps):
-                self.lr_scheduler.step()
+        """Advance only legacy weight-only resumes; full-state resumes load it."""
+
+        if self._full_training_state_loaded:
             logger.info(
-                f"LR scheduler adjusted to step {self.completed_steps}, current LR: {self.lr_scheduler.get_last_lr()}"
+                "LR scheduler restored from full training state; "
+                f"current LR: {self.lr_scheduler.get_last_lr()}"
+            )
+            return
+        scheduler_step_offset = int(
+            self.config.trainer.get("scheduler_step_offset", 0)
+        )
+        if scheduler_step_offset < 0:
+            raise ValueError("trainer.scheduler_step_offset must be non-negative")
+        scheduler_total_steps = int(
+            self.config.trainer.get(
+                "scheduler_total_steps", self.config.trainer.max_train_steps
+            )
+        )
+        scheduler_steps = min(
+            scheduler_step_offset + self.completed_steps,
+            scheduler_total_steps,
+        )
+        if scheduler_steps > 0:
+            logger.info(
+                "Adjusting LR scheduler to global step "
+                f"{scheduler_steps} (offset={scheduler_step_offset}, "
+                f"phase_step={self.completed_steps})"
+            )
+            for _ in range(scheduler_steps):
+                self._step_lr_scheduler()
+            logger.info(
+                f"LR scheduler adjusted to step {scheduler_steps}, "
+                f"current LR: {self.lr_scheduler.get_last_lr()}"
             )
 
     def _load_checkpoint(self, checkpoint_path):
         """Load checkpoint."""
         self.accelerator.load_state(checkpoint_path)
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
+
+    def _training_state_metadata(self):
+        """Describe the exact next optimization step represented by a save."""
+
+        scheduler_step_offset = int(
+            self.config.trainer.get("scheduler_step_offset", 0)
+        )
+        stage1_steps = int(
+            self.config.framework.get("intent", {}).get("stage1_steps", 0)
+        )
+        next_stage = (
+            "s1"
+            if self.config.framework.get("intent", {}).get("training_stage")
+            == "s1_s2"
+            and self.completed_steps < stage1_steps
+            else "s2"
+        )
+        return {
+            "format_version": 1,
+            "completed_steps": int(self.completed_steps),
+            "global_scheduler_step": int(
+                scheduler_step_offset + self.completed_steps
+            ),
+            "next_training_stage": next_stage,
+            "stage1_steps": stage1_steps,
+            "optimizer": "AdamW",
+            "lr_schedule_id": str(
+                self.config.trainer.get("lr_schedule_id", "default")
+            ),
+            "scheduler_last_epoch": int(
+                self._unwrap_lr_scheduler(self.lr_scheduler).last_epoch
+            ),
+            "parameter_group_names": [
+                str(group.get("name", index))
+                for index, group in enumerate(self.optimizer.param_groups)
+            ],
+        }
+
+    def _prune_old_training_states(self):
+        """Keep recent full states while retaining every lightweight model file."""
+
+        keep_last = int(
+            self.config.trainer.get("training_state_keep_last", 0)
+        )
+        if keep_last <= 0:
+            return
+        states = []
+        for path in Path(self.checkpoint_dir).iterdir():
+            match = re.fullmatch(r"steps_(\d+)_training_state", path.name)
+            if path.is_dir() and match is not None:
+                states.append((int(match.group(1)), path))
+        states.sort(key=lambda item: item[0])
+        for _, path in states[:-keep_last]:
+            shutil.rmtree(path)
+            logger.info(
+                "Removed old full training state to limit disk use: "
+                f"{path}. The corresponding model-only checkpoint is retained."
+            )
 
     def _save_checkpoint(self):
         """Save current training state."""
@@ -421,21 +771,94 @@ class VLATrainer(TrainerUtils):
 
         self.accelerator.wait_for_everyone()
 
+        if bool(self.config.trainer.get("save_training_state", False)):
+            training_state_dir = os.path.join(
+                self.checkpoint_dir,
+                f"steps_{self.completed_steps}_training_state",
+            )
+            if self.accelerator.is_main_process:
+                state_path = Path(training_state_dir)
+                if state_path.exists():
+                    marker = state_path / "trainer_state.json"
+                    if marker.exists():
+                        raise FileExistsError(
+                            "Refusing to overwrite a completed training state: "
+                            f"{training_state_dir}"
+                        )
+                    shutil.rmtree(state_path)
+                    logger.warning(
+                        "Removed an incomplete state directory left by an "
+                        f"interrupted save: {training_state_dir}"
+                    )
+            self.accelerator.wait_for_everyone()
+
+            # All ranks must participate because DeepSpeed ZeRO stores sharded
+            # model/optimizer state. The scheduler was included in prepare().
+            self.accelerator.save_state(training_state_dir)
+            self.accelerator.wait_for_everyone()
+
+            if self.accelerator.is_main_process:
+                metadata_path = Path(training_state_dir) / "trainer_state.json"
+                metadata_tmp = metadata_path.with_suffix(".json.tmp")
+                metadata_tmp.write_text(
+                    json.dumps(
+                        self._training_state_metadata(),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(metadata_tmp, metadata_path)
+                self._prune_old_training_states()
+                self.accelerator.print(
+                    "✅ Full model/AdamW/scheduler/RNG state saved at "
+                    f"{training_state_dir}"
+                )
+            self.accelerator.wait_for_everyone()
+
     def _log_metrics(self, metrics):
         """Record training metrics."""
         if self.completed_steps % self.config.trainer.logging_frequency == 0 and dist.get_rank() == 0:
+            phase_step = self.completed_steps
+            wandb_step_offset = int(
+                self.config.trainer.get("wandb_step_offset", 0)
+            )
+            if wandb_step_offset < 0:
+                raise ValueError("trainer.wandb_step_offset must be non-negative")
+            global_completed_steps = wandb_step_offset + phase_step
             last_lrs = self.lr_scheduler.get_last_lr()
             for i, group in enumerate(self.optimizer.param_groups):
                 group_name = group.get("name", str(i))
                 metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
-            metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
-            if getattr(self, "_wandb_enabled", False):
+            metrics["training/phase_step"] = phase_step
+            metrics["training/phase_id"] = int(
+                self.config.trainer.get("training_phase_id", 0)
+            )
+            recovered_from_step = self.config.trainer.get(
+                "recovered_from_phase_step", None
+            )
+            if recovered_from_step is not None:
+                metrics["training/recovered_from_phase_step"] = int(
+                    recovered_from_step
+                )
+            metrics["epoch"] = round(
+                global_completed_steps / len(self.vla_train_dataloader), 2
+            )
+            wandb_log_after_step = int(
+                self.config.trainer.get("wandb_log_after_step", -1)
+            )
+            should_log_to_wandb = global_completed_steps > wandb_log_after_step
+            if getattr(self, "_wandb_enabled", False) and should_log_to_wandb:
                 try:
-                    wandb.log(metrics, step=self.completed_steps)
+                    wandb.log(metrics, step=global_completed_steps)
                 except Exception as exc:
                     self._wandb_enabled = False
                     logger.warning(f"W&B log failed; disabling W&B: {exc}")
-            logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+            logger.info(
+                f"Phase step {phase_step}, global logging step "
+                f"{global_completed_steps}, Loss: {metrics})"
+            )
 
     def _create_data_iterators(self):
         """Create data iterators."""
@@ -474,7 +897,10 @@ class VLATrainer(TrainerUtils):
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
 
-            if self.accelerator.sync_gradients:
+            optimizer_stepped = step_metrics.pop(
+                "_optimizer_step", self.accelerator.sync_gradients
+            )
+            if optimizer_stepped:
                 progress_bar.update(1)
                 self.completed_steps += 1
 
@@ -487,22 +913,269 @@ class VLATrainer(TrainerUtils):
                 )
 
             if (
-                bool(self.config.trainer.get("enable_action_eval", True))
+                optimizer_stepped
+                and bool(self.config.trainer.get("enable_action_eval", True))
                 and self.completed_steps % self.config.trainer.eval_interval == 0
             ):
                 step_metrics = self.eval_action_model(step_metrics)
 
+            validation_interval = int(
+                self.config.trainer.get("intent_validation_interval", 0)
+            )
+            if (
+                optimizer_stepped
+                and self.vla_validation_dataloader is not None
+                and validation_interval > 0
+                and self.completed_steps % validation_interval == 0
+            ):
+                step_metrics.update(self.eval_factorized_intent())
+
             step_metrics["timing/data"] = t_end_data - t_start_data
             step_metrics["timing/model"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
+            if optimizer_stepped:
+                self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            if (
+                optimizer_stepped
+                and self.completed_steps % self.config.trainer.save_interval == 0
+                and self.completed_steps > 0
+            ):
                 self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
                 break
 
         self._finalize_training()
+
+    @staticmethod
+    def _classification_metrics_from_confusion(
+        confusion: torch.Tensor,
+    ) -> tuple[float, float]:
+        confusion = confusion.double()
+        tp = confusion.diag()
+        support = confusion.sum(dim=1)
+        predicted = confusion.sum(dim=0)
+        recall = tp / support.clamp_min(1)
+        precision = tp / predicted.clamp_min(1)
+        f1 = 2 * precision * recall / (precision + recall).clamp_min(1.0e-12)
+        occupied = support > 0
+        return (
+            f1[occupied].mean().item() if occupied.any() else 0.0,
+            recall[occupied].mean().item() if occupied.any() else 0.0,
+        )
+
+    @torch.inference_mode()
+    def eval_factorized_intent(self) -> dict[str, float]:
+        """Evaluate the fixed trajectory-level validation split and save best S0."""
+
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        if not getattr(unwrapped_model, "use_factorized_intent", False):
+            return {}
+        was_training = self.model.training
+        self.model.eval()
+        full_interval = int(
+            self.config.trainer.get("intent_validation_full_interval", 5000)
+        )
+        run_full = full_interval > 0 and self.completed_steps % full_interval == 0
+        subset_batches = int(
+            self.config.trainer.get("intent_validation_subset_batches", 128)
+        )
+        max_batches = len(self.vla_validation_dataloader) if run_full else subset_batches
+        max_batches = min(max_batches, len(self.vla_validation_dataloader))
+
+        confusions = {
+            "xyz": torch.zeros(125, 125, device=self.accelerator.device, dtype=torch.long),
+            "rpy": torch.zeros(125, 125, device=self.accelerator.device, dtype=torch.long),
+            "gripper": torch.zeros(5, 5, device=self.accelerator.device, dtype=torch.long),
+        }
+        loss_sums = {
+            name: torch.zeros((), device=self.accelerator.device)
+            for name in ("xyz", "rpy", "gripper")
+        }
+        top5_correct = {
+            name: torch.zeros((), device=self.accelerator.device, dtype=torch.long)
+            for name in ("xyz", "rpy", "gripper")
+        }
+        entropy_sums = {
+            name: torch.zeros((), device=self.accelerator.device)
+            for name in ("xyz", "rpy", "gripper")
+        }
+        axis_correct = {
+            name: torch.zeros(3, device=self.accelerator.device)
+            for name in ("xyz", "rpy")
+        }
+        axis_distance = {
+            name: torch.zeros(3, device=self.accelerator.device)
+            for name in ("xyz", "rpy")
+        }
+        within_chebyshev_one = {
+            name: torch.zeros((), device=self.accelerator.device)
+            for name in ("xyz", "rpy")
+        }
+        sample_count = torch.zeros(
+            (), device=self.accelerator.device, dtype=torch.long
+        )
+        for batch_index, examples in enumerate(self.vla_validation_dataloader):
+            if batch_index >= max_batches:
+                break
+            output = self.model(examples)
+            batch_size = len(examples)
+            sample_count += batch_size
+            for name, classes in (("xyz", 125), ("rpy", 125), ("gripper", 5)):
+                logits = output[f"intent_{name}_logits"]
+                targets = output[f"intent_{name}_targets"]
+                predictions = logits.argmax(dim=-1)
+                probabilities = torch.softmax(logits.float(), dim=-1)
+                entropy_sums[name] += (
+                    -(
+                        probabilities
+                        * probabilities.clamp_min(
+                            torch.finfo(torch.float32).tiny
+                        ).log()
+                    ).sum(dim=-1)
+                ).sum()
+                top5_correct[name] += (
+                    logits.topk(min(5, classes), dim=-1)
+                    .indices.eq(targets[:, None])
+                    .any(dim=-1)
+                    .sum()
+                )
+                flat = targets * classes + predictions
+                confusions[name] += torch.bincount(
+                    flat, minlength=classes * classes
+                ).reshape(classes, classes)
+                loss_sums[name] += (
+                    torch.nn.functional.cross_entropy(
+                        logits.float(), targets, reduction="sum"
+                    )
+                )
+                if name in axis_correct:
+                    predicted_bins = torch.stack(
+                        [
+                            predictions // 25,
+                            (predictions % 25) // 5,
+                            predictions % 5,
+                        ],
+                        dim=-1,
+                    )
+                    target_bins = torch.stack(
+                        [
+                            targets // 25,
+                            (targets % 25) // 5,
+                            targets % 5,
+                        ],
+                        dim=-1,
+                    )
+                    distance = (predicted_bins - target_bins).abs().float()
+                    axis_correct[name] += (distance == 0).sum(dim=0)
+                    axis_distance[name] += distance.sum(dim=0)
+                    within_chebyshev_one[name] += (
+                        distance.max(dim=-1).values <= 1
+                    ).sum()
+
+        sample_count = self.accelerator.reduce(sample_count, reduction="sum")
+        for name in confusions:
+            confusions[name] = self.accelerator.reduce(
+                confusions[name], reduction="sum"
+            )
+            loss_sums[name] = self.accelerator.reduce(
+                loss_sums[name], reduction="sum"
+            )
+            top5_correct[name] = self.accelerator.reduce(
+                top5_correct[name], reduction="sum"
+            )
+            entropy_sums[name] = self.accelerator.reduce(
+                entropy_sums[name], reduction="sum"
+            )
+            if name in axis_correct:
+                axis_correct[name] = self.accelerator.reduce(
+                    axis_correct[name], reduction="sum"
+                )
+                axis_distance[name] = self.accelerator.reduce(
+                    axis_distance[name], reduction="sum"
+                )
+                within_chebyshev_one[name] = self.accelerator.reduce(
+                    within_chebyshev_one[name], reduction="sum"
+                )
+        count = max(int(sample_count.item()), 1)
+        metrics = {
+            "validation/num_samples": float(sample_count.item()),
+            "validation/is_full": float(run_full),
+        }
+        macro_f1 = {}
+        for name in ("xyz", "rpy", "gripper"):
+            f1, balanced_accuracy = self._classification_metrics_from_confusion(
+                confusions[name]
+            )
+            macro_f1[name] = f1
+            metrics[f"validation/{name}_macro_f1"] = f1
+            metrics[f"validation/{name}_balanced_accuracy"] = balanced_accuracy
+            metrics[f"validation/{name}_ce"] = loss_sums[name].item() / count
+            metrics[f"validation/{name}_top1_accuracy"] = (
+                confusions[name].diag().sum().item() / count
+            )
+            metrics[f"validation/{name}_top5_accuracy"] = (
+                top5_correct[name].item() / count
+            )
+            metrics[f"validation/{name}_probability_entropy"] = (
+                entropy_sums[name].item() / count
+            )
+            if name in axis_correct:
+                for axis_index, axis_name in enumerate(("x", "y", "z")):
+                    metrics[
+                        f"validation/{name}_{axis_name}_accuracy"
+                    ] = axis_correct[name][axis_index].item() / count
+                    metrics[
+                        f"validation/{name}_{axis_name}_mean_bin_distance"
+                    ] = axis_distance[name][axis_index].item() / count
+                metrics[
+                    f"validation/{name}_within_chebyshev_1_accuracy"
+                ] = within_chebyshev_one[name].item() / count
+        score = (
+            0.4 * macro_f1["xyz"]
+            + 0.4 * macro_f1["rpy"]
+            + 0.2 * macro_f1["gripper"]
+        )
+        metrics["validation/selection_score"] = score
+        if run_full and score > self.best_intent_validation_score:
+            self.best_intent_validation_score = score
+            self._save_best_intent_checkpoint(metrics)
+        if was_training:
+            self.model.train()
+        return metrics
+
+    def _save_best_intent_checkpoint(self, metrics: dict[str, float]) -> None:
+        """Persist only the best validation-selected Intent branch."""
+
+        if self.accelerator.is_main_process:
+            intent_head = getattr(
+                self.accelerator.unwrap_model(self.model), "intent_head"
+            )
+            intent_state = {
+                f"intent_head.{name}": value.detach().cpu()
+                for name, value in intent_head.state_dict().items()
+            }
+            path = Path(self.checkpoint_dir) / "best_intent_pytorch_model.pt"
+            torch.save(intent_state, path)
+            write_path = Path(self.checkpoint_dir) / "best_intent_metrics.json"
+            write_path.write_text(
+                json.dumps(
+                    {
+                        "step": self.completed_steps,
+                        "selection_score": self.best_intent_validation_score,
+                        **metrics,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            logger.info(
+                "Saved best validation Intent checkpoint at step %s: score=%.6f",
+                self.completed_steps,
+                self.best_intent_validation_score,
+            )
+        self.accelerator.wait_for_everyone()
 
     def eval_action_model(self, step_metrics: dict = None) -> float:
         """Run simple action-eval on current batch and attach score to metrics."""
@@ -559,13 +1232,17 @@ class VLATrainer(TrainerUtils):
             % int(self.config.trainer.logging_frequency)
             == 0
         )
-        with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        if hasattr(unwrapped_model, "set_training_step"):
+            unwrapped_model.set_training_step(self.completed_steps)
 
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
-            if hasattr(unwrapped_model, "set_training_step"):
-                unwrapped_model.set_training_step(self.completed_steps)
-
+        # Under ZeRO-2/3, DeepSpeed owns gradient-accumulation boundaries.
+        # Accelerate's accumulate() context uses no_sync(), which DeepSpeed
+        # explicitly disallows with partitioned gradients when accumulation > 1.
+        is_deepspeed_engine = hasattr(
+            self.model, "is_gradient_accumulation_boundary"
+        ) and hasattr(self.model, "backward")
+        if is_deepspeed_engine:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
@@ -573,27 +1250,50 @@ class VLATrainer(TrainerUtils):
                 # Existing frameworks keep their original action-only behavior.
                 total_loss = output_dict.get("total_loss", action_loss)
 
-            self.accelerator.backward(total_loss)
+            self.model.backward(total_loss)
+            optimizer_stepped = bool(
+                self.model.is_gradient_accumulation_boundary()
+            )
 
-            # E1 connectivity diagnostics are captured before global clipping
-            # and optimizer.step(), while parameter gradients are still present.
+            # Capture pre-clipping gradients only for the micro-step that will
+            # produce the logged optimizer update. DeepSpeed applies the
+            # configured global clipping inside engine.step().
             gradient_metrics = {}
-            if will_log:
+            if will_log and optimizer_stepped:
                 gradient_metrics = self._collect_intent_gradient_metrics(
                     unwrapped_model
                 )
 
-            if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+            self.model.step()
+            if optimizer_stepped:
+                self._step_lr_scheduler()
+        else:
+            with self.accelerator.accumulate(self.model):
+                self.optimizer.zero_grad()
 
-            self.optimizer.step()
-            # Only step the LR scheduler when gradients are actually synced
-            # (i.e., not mid-accumulation). Without this guard the scheduler
-            # runs gradient_accumulation_steps times faster than intended,
-            # causing warmup to end too early and cosine decay to bottom out
-            # at min_lr well before max_train_steps is reached.
-            if self.accelerator.sync_gradients:
-                self.lr_scheduler.step()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    output_dict = self.model.forward(batch_vla)
+                    action_loss = output_dict["action_loss"]
+                    total_loss = output_dict.get("total_loss", action_loss)
+
+                self.accelerator.backward(total_loss)
+
+                gradient_metrics = {}
+                if will_log:
+                    gradient_metrics = self._collect_intent_gradient_metrics(
+                        unwrapped_model
+                    )
+
+                if self.config.trainer.gradient_clipping is not None:
+                    self.accelerator.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.trainer.gradient_clipping,
+                    )
+
+                self.optimizer.step()
+                optimizer_stepped = self.accelerator.sync_gradients
+                if optimizer_stepped:
+                    self._step_lr_scheduler()
 
         metrics = {
             "action_dit_loss": self._metric_scalar(action_loss, aggregate=will_log),
@@ -608,6 +1308,7 @@ class VLATrainer(TrainerUtils):
                 for name, value in gradient_metrics.items()
             }
         )
+        metrics["_optimizer_step"] = optimizer_stepped
         optional_metric_names = {
             "intent_loss": "intent_ce",
             "weighted_intent_loss": "weighted_intent_loss",
@@ -615,6 +1316,7 @@ class VLATrainer(TrainerUtils):
             "intent_top5_accuracy": "intent_top5_accuracy",
             "intent_probability_entropy": "intent/probability_entropy",
             "intent_max_probability": "intent/max_probability",
+            "intent_film_confidence_mean": "intent/film_confidence_mean",
             "intent_condition_l2_mean": "intent_condition/l2_mean",
             "intent_condition_abs_mean": "intent_condition/abs_mean",
             "intent_to_timestep_weight_norm": "intent_to_timestep/weight_norm",
@@ -638,7 +1340,23 @@ class VLATrainer(TrainerUtils):
             "ffn_film_delta_gamma_rms_mean": "ffn_film/delta_gamma_rms_mean",
             "ffn_film_delta_beta_rms_mean": "ffn_film/delta_beta_rms_mean",
             "ffn_film_modulation_to_input_l2_ratio_mean": "ffn_film/modulation_to_input_l2_ratio_mean",
+            "query_film_raw_delta_gamma_abs_max_mean": "query_film/raw_delta_gamma_abs_max",
+            "query_film_raw_delta_beta_abs_max_mean": "query_film/raw_delta_beta_abs_max",
+            "query_film_bounded_delta_gamma_abs_max_mean": "query_film/bounded_delta_gamma_abs_max",
+            "query_film_bounded_delta_beta_abs_max_mean": "query_film/bounded_delta_beta_abs_max",
         }
+        for head in ("xyz", "rpy", "gripper"):
+            optional_metric_names.update(
+                {
+                    f"intent_{head}_loss": f"intent/{head}_ce",
+                    f"intent_{head}_top1_accuracy": f"intent/{head}_top1_accuracy",
+                    f"intent_{head}_top5_accuracy": f"intent/{head}_top5_accuracy",
+                    f"intent_{head}_probability_entropy": f"intent/{head}_probability_entropy",
+                    f"intent_{head}_max_probability": f"intent/{head}_max_probability",
+                    f"intent_{head}_feature_l2_mean": f"intent/{head}_feature_l2_mean",
+                    f"intent_{head}_layer_attention_entropy": f"intent/{head}_layer_attention_entropy",
+                }
+            )
         for output_name, metric_name in optional_metric_names.items():
             value = output_dict.get(output_name)
             if isinstance(value, torch.Tensor) and value.numel() == 1:
@@ -655,6 +1373,16 @@ class VLATrainer(TrainerUtils):
                 layer = output_name.rsplit("_", 1)[-1]
                 metrics[f"intent/token_attention_entropy_{layer}"] = self._metric_scalar(
                     value, aggregate=will_log
+                )
+            elif (
+                output_name.startswith("intent_xyz_layer_attention_weight_")
+                or output_name.startswith("intent_rpy_layer_attention_weight_")
+                or output_name.startswith("intent_gripper_layer_attention_weight_")
+            ):
+                prefix, layer = output_name.rsplit("_", 1)
+                head = prefix.split("_")[1]
+                metrics[f"intent/{head}_layer_attention_weight_{layer}"] = (
+                    self._metric_scalar(value, aggregate=will_log)
                 )
         return metrics
 
@@ -692,7 +1420,9 @@ def main(cfg) -> None:
 
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
-    vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    vla_train_dataloader, vla_validation_dataloader = prepare_data(
+        cfg=cfg, accelerator=accelerator, output_dir=output_dir
+    )
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLATrainer(
@@ -702,6 +1432,7 @@ def main(cfg) -> None:
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         accelerator=accelerator,
+        vla_validation_dataloader=vla_validation_dataloader,
     )
 
     trainer.prepare_training()

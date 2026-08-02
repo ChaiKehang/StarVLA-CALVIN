@@ -22,7 +22,7 @@ CACHE_ROOT=/home/data/datasets/kehang-CALVIN/.cache
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-unset}"
 echo "SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset}"
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3}"
 
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
   echo "[ERROR] Run this file with sbatch, not bash." >&2

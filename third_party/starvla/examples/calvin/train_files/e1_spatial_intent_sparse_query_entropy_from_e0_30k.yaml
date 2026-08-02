@@ -1,13 +1,15 @@
-# E1 Spatial Intent v2 main experiment. S1 and S2 together consume exactly
-# 90k optimizer steps, matching E0's Action-update budget. The v2 Intent branch
-# must be overlaid from the matching S0 v2 run.
-run_id: e1_spatial_intent_query_ffn_v2_s1_s2_90k
+# Sparse Query-only Spatial Intent experiment.
+# Action weights start from the matched E0 30k checkpoint. The phase-local
+# S1 10k + S2 50k run continues the original 90k cosine schedule at global
+# scheduler/W&B step 30k. The pretrained S0 v2 Intent branch is overlaid
+# independently by the launcher.
+run_id: e1_spatial_intent_sparse_query_entropy_from_e0_30k
 run_root_dir: /home/data/models/kehang-StarVLA/checkpoints/calvin
 seed: 42
 wandb_entity: disabled
-wandb_project: starVLA_Calvin_E1_Spatial_Intent_Main_V2
+wandb_project: starVLA_Calvin_E1_Sparse_Query_Entropy
 is_debug: false
-version_id: "e1_spatial_intent_query_ffn_v2_s1_s2_v1"
+version_id: "e1_sparse_query_11_23_35_linear_entropy_from_e0_30k_v1"
 
 framework:
   name: QwenPIIntent_v3
@@ -44,12 +46,13 @@ framework:
 
   intent:
     training_stage: s1_s2
-    stage1_steps: 15000
+    stage1_steps: 10000
+
+    # Reuse the exact Spatial Intent Aggregator v2 architecture from S0.
     use_multilayer_aggregator: true
     source_layers: [4, 8, 12, 16, 20, 24, 28, 32, 36]
     initialize_projectors_from_action: true
     use_layer_position_embedding: true
-
     aggregator_block_type: query_ffn_v2
     token_query_use_ffn: true
     layer_query_use_ffn: true
@@ -58,19 +61,22 @@ framework:
     query_attention_dropout: 0.0
     query_norm_eps: 1.0e-5
 
-    # Both Action-FiLM mechanisms consume the differentiable 125-way soft
-    # probability vector, not the unconstrained 1024-D aggregator feature.
     action_condition_source: probabilities
     return_attention_diagnostics: true
     attention_diagnostics_interval: 100
 
     use_aux_loss: true
+    loss_weight: 0.01
     add_to_timestep_embedding: false
-    use_ffn_film: true
+    use_ffn_film: false
     use_cross_attn_query_film: true
+    # 1-based DiT block numbers. Under the canonical interleaving these three
+    # are cross-attention blocks; 12/24/36 would be self-attention blocks.
+    query_film_layers: [11, 23, 35]
+    use_entropy_confidence_gate: true
     film_projector_type: mlp
     film_hidden_dim: 256
-    loss_weight: 0.1
+
     hidden_size: 1024
     num_attention_heads: 16
     classifier_hidden_size: 512
@@ -108,8 +114,14 @@ datasets:
     video_backend: torchvision_av
 
 trainer:
-  max_train_steps: 90000
+  # These are phase-local steps. Combined with the E0 30k initialization,
+  # phase step 60k corresponds to global Action/scheduler step 90k.
+  max_train_steps: 60000
   num_warmup_steps: 5000
+  scheduler_total_steps: 90000
+  scheduler_step_offset: 30000
+  wandb_step_offset: 30000
+
   save_interval: 5000
   eval_interval: 1000
   enable_action_eval: true
@@ -119,18 +131,18 @@ trainer:
 
   learning_rate:
     base: 2.5e-05
-    intent_head.project_layers: 5.0e-05
-    intent_head.token_query_block.attention: 5.0e-05
-    intent_head.token_query_block.ffn: 5.0e-05
-    intent_head.layer_query_block.attention: 5.0e-05
-    intent_head.layer_query_block.ffn: 5.0e-05
-    intent_head.classifier: 1.0e-04
-    intent_head: 5.0e-05
+    intent_head.project_layers: 1.0e-06
+    intent_head.token_query_block.attention: 1.0e-06
+    intent_head.token_query_block.ffn: 1.0e-06
+    intent_head.layer_query_block.attention: 1.0e-06
+    intent_head.layer_query_block.ffn: 1.0e-06
+    intent_head.classifier: 2.0e-06
+    intent_head: 1.0e-06
     action_model: 1.0e-04
 
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
-    min_lr: 1.0e-06
+    min_lr_rate: 0.04
 
   freeze_modules: qwen_vl_interface
   loss_scale:

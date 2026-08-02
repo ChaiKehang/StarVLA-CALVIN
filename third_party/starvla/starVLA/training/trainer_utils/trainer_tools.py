@@ -123,6 +123,20 @@ def build_param_lr_groups(model, cfg):
     for module_name, lr in lr_cfg.items():
         if module_name == "base":
             continue
+        if module_name == "query_film_router":
+            params = [
+                parameter
+                for name, parameter in model.named_parameters()
+                if ".cross_attn_query_intent_film." in name
+                and id(parameter) not in frozen_params
+                and id(parameter) not in used_params
+            ]
+            if params:
+                param_groups.append(
+                    {"params": params, "lr": lr, "name": module_name}
+                )
+                used_params.update(id(parameter) for parameter in params)
+            continue
         # try to find the module under vla by module_name (support nested paths)
         module = model
         try:

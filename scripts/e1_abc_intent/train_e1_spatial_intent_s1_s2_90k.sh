@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run inside an already allocated one- or two-GPU node/tmux shell.
-# S1 (default 10k) + S2 (remaining steps) share one continuous 90k run.
+# S1 (default 15k) + S2 (remaining steps) share one continuous 90k run.
 
 set -euo pipefail
 
@@ -8,6 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 STARVLA_DIR="${STARVLA_DIR:-${PROJECT_ROOT}/third_party/starvla}"
 CONFIG_YAML="${CONFIG_YAML:-${STARVLA_DIR}/examples/calvin/train_files/e1_spatial_intent_s1_s2_90k.yaml}"
+ACCELERATE_CONFIG_FILE="${ACCELERATE_CONFIG_FILE:-${STARVLA_DIR}/starVLA/config/deepseeds/deepspeed_zero2.yaml}"
+ACCELERATE_BIN="${ACCELERATE_BIN:-/home/liuchang/miniconda3/envs/starvla-e0/bin/accelerate}"
 
 MODEL_ROOT="${MODEL_ROOT:-/home/data/models/kehang-StarVLA}"
 LEROBOT_ROOT="${LEROBOT_ROOT:-/home/data/datasets/kehang-CALVIN/calvin/lerobot}"
@@ -18,23 +20,99 @@ PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-${MODEL_ROOT}/pretrained/starvla
 S0_STEPS="${S0_STEPS:-30000}"
 S0_RUN_ID="${S0_RUN_ID:-e1_spatial_intent_s0_${S0_STEPS}}"
 S0_INTENT_CHECKPOINT="${S0_INTENT_CHECKPOINT:-${CHECKPOINT_ROOT}/${S0_RUN_ID}/checkpoints/steps_${S0_STEPS}_pytorch_model.pt}"
-STAGE1_STEPS="${STAGE1_STEPS:-10000}"
+STAGE1_STEPS="${STAGE1_STEPS:-15000}"
 MAIN_MAX_STEPS="${MAIN_MAX_STEPS:-90000}"
+ACTION_STEP_OFFSET="${ACTION_STEP_OFFSET:-0}"
 RUN_ID="${RUN_ID:-e1_spatial_intent_query_ffn_s1_s2_90k}"
-PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-8}"
+PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-4}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
+RESUME_STEP="${RESUME_STEP:-}"
+RESUME_TRAINING_STATE="${RESUME_TRAINING_STATE:-}"
+RESUME_IN_PLACE="${RESUME_IN_PLACE:-false}"
+SCHEDULER_TOTAL_STEPS="${SCHEDULER_TOTAL_STEPS:-$((ACTION_STEP_OFFSET + MAIN_MAX_STEPS))}"
+NUM_WARMUP_STEPS="${NUM_WARMUP_STEPS:-5000}"
+WANDB_LOG_AFTER_STEP_OVERRIDE="${WANDB_LOG_AFTER_STEP_OVERRIDE:-}"
+RECOVERED_FROM_PHASE_STEP_OVERRIDE="${RECOVERED_FROM_PHASE_STEP_OVERRIDE:-}"
+TRAINING_PHASE_ID_OVERRIDE="${TRAINING_PHASE_ID_OVERRIDE:-}"
+CHECK_ONLY="${CHECK_ONLY:-false}"
 CACHE_ROOT="${CACHE_ROOT:-${PROJECT_ROOT}/.cache}"
 WATCHDOG_INTERVAL_SECONDS="${WATCHDOG_INTERVAL_SECONDS:-5}"
 MIN_AVAILABLE_RAM_GB="${MIN_AVAILABLE_RAM_GB:-12}"
 MAX_GPU_MEMORY_MIB="${MAX_GPU_MEMORY_MIB:-49000}"
 
-if [[ "${MAIN_MAX_STEPS}" != "90000" ]]; then
-  echo "[ERROR] MAIN_MAX_STEPS must remain 90000 for the matched E0 comparison." >&2
+if (( ACTION_STEP_OFFSET < 0 )); then
+  echo "[ERROR] ACTION_STEP_OFFSET must be non-negative, got ${ACTION_STEP_OFFSET}." >&2
+  exit 2
+fi
+if (( MAIN_MAX_STEPS + ACTION_STEP_OFFSET != 90000 )); then
+  echo "[ERROR] ACTION_STEP_OFFSET + MAIN_MAX_STEPS must equal 90000 for the matched E0 comparison; got ${ACTION_STEP_OFFSET} + ${MAIN_MAX_STEPS}." >&2
   exit 2
 fi
 if (( STAGE1_STEPS <= 0 || STAGE1_STEPS >= MAIN_MAX_STEPS )); then
   echo "[ERROR] STAGE1_STEPS must be within (0, ${MAIN_MAX_STEPS}), got ${STAGE1_STEPS}." >&2
   exit 2
 fi
+if (( PER_DEVICE_BATCH_SIZE <= 0 || GRADIENT_ACCUMULATION_STEPS <= 0 )); then
+  echo "[ERROR] Batch size and gradient accumulation must be positive; got batch=${PER_DEVICE_BATCH_SIZE}, accumulation=${GRADIENT_ACCUMULATION_STEPS}." >&2
+  exit 2
+fi
+if (( SCHEDULER_TOTAL_STEPS <= 0 || NUM_WARMUP_STEPS < 0 )); then
+  echo "[ERROR] Scheduler steps must be positive and warmup non-negative; got total=${SCHEDULER_TOTAL_STEPS}, warmup=${NUM_WARMUP_STEPS}." >&2
+  exit 2
+fi
+if [[ -n "${RESUME_CHECKPOINT}" || -n "${RESUME_STEP}" ]]; then
+  if [[ -z "${RESUME_CHECKPOINT}" || -z "${RESUME_STEP}" ]]; then
+    echo "[ERROR] RESUME_CHECKPOINT and RESUME_STEP must be set together." >&2
+    exit 2
+  fi
+  if [[ ! "${RESUME_STEP}" =~ ^[0-9]+$ ]] || (( RESUME_STEP <= 0 || RESUME_STEP >= MAIN_MAX_STEPS )); then
+    echo "[ERROR] RESUME_STEP must be an integer within (0, ${MAIN_MAX_STEPS}), got ${RESUME_STEP}." >&2
+    exit 2
+  fi
+  if [[ ! -f "${RESUME_CHECKPOINT}" ]]; then
+    echo "[ERROR] Resume checkpoint does not exist: ${RESUME_CHECKPOINT}" >&2
+    exit 2
+  fi
+  LEGACY_WEIGHT_RESUME=true
+else
+  LEGACY_WEIGHT_RESUME=false
+fi
+if [[ -n "${RESUME_TRAINING_STATE}" ]]; then
+  if [[ ! -d "${RESUME_TRAINING_STATE}" || ! -f "${RESUME_TRAINING_STATE}/trainer_state.json" ]]; then
+    echo "[ERROR] Full training state is incomplete or missing: ${RESUME_TRAINING_STATE}" >&2
+    exit 2
+  fi
+  FULL_STATE_RESUME=true
+else
+  FULL_STATE_RESUME=false
+fi
+if [[ "${LEGACY_WEIGHT_RESUME}" == "true" && "${FULL_STATE_RESUME}" == "true" ]]; then
+  echo "[ERROR] Use either RESUME_CHECKPOINT/RESUME_STEP or RESUME_TRAINING_STATE, not both." >&2
+  exit 2
+fi
+if [[ "${RESUME_IN_PLACE}" != "true" && "${RESUME_IN_PLACE}" != "false" ]]; then
+  echo "[ERROR] RESUME_IN_PLACE must be true or false, got ${RESUME_IN_PLACE}." >&2
+  exit 2
+fi
+if [[ "${CHECK_ONLY}" != "true" && "${CHECK_ONLY}" != "false" ]]; then
+  echo "[ERROR] CHECK_ONLY must be true or false, got ${CHECK_ONLY}." >&2
+  exit 2
+fi
+if [[ "${RESUME_IN_PLACE}" == "true" || "${LEGACY_WEIGHT_RESUME}" == "true" || "${FULL_STATE_RESUME}" == "true" ]]; then
+  IS_RESUME=true
+else
+  IS_RESUME=false
+fi
+for integer_override in \
+  "${WANDB_LOG_AFTER_STEP_OVERRIDE}" \
+  "${RECOVERED_FROM_PHASE_STEP_OVERRIDE}" \
+  "${TRAINING_PHASE_ID_OVERRIDE}"; do
+  if [[ -n "${integer_override}" && ! "${integer_override}" =~ ^[0-9]+$ ]]; then
+    echo "[ERROR] Recovery step/phase overrides must be non-negative integers." >&2
+    exit 2
+  fi
+done
 # Respect Slurm's visibility when present. Outside Slurm, default to physical 2,3.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
 IFS=',' read -r -a VISIBLE_GPUS <<<"${CUDA_VISIBLE_DEVICES}"
@@ -97,21 +175,63 @@ watchdog() {
   done
 }
 
-for required in "${STARVLA_DIR}" "${CONFIG_YAML}" "${LEROBOT_ROOT}" "${BASE_VLM}" \
-  "${PRETRAINED_CHECKPOINT}" "${S0_INTENT_CHECKPOINT}"; do
+REQUIRED_PATHS=(
+  "${STARVLA_DIR}"
+  "${CONFIG_YAML}"
+  "${ACCELERATE_CONFIG_FILE}"
+  "${ACCELERATE_BIN}"
+  "${LEROBOT_ROOT}"
+  "${BASE_VLM}"
+)
+if [[ "${IS_RESUME}" == "false" ]]; then
+  REQUIRED_PATHS+=("${PRETRAINED_CHECKPOINT}" "${S0_INTENT_CHECKPOINT}")
+fi
+
+for required in "${REQUIRED_PATHS[@]}"; do
   if [[ ! -e "${required}" ]]; then
     echo "[ERROR] Required path does not exist: ${required}" >&2
     if [[ "${required}" == "${S0_INTENT_CHECKPOINT}" ]]; then
-      echo "Set S0_INTENT_CHECKPOINT to the chosen 10k-30k S0 checkpoint." >&2
+      echo "Set S0_INTENT_CHECKPOINT to the chosen S0 checkpoint." >&2
     fi
     exit 2
   fi
 done
 
 TARGET_RUN_DIR="${CHECKPOINT_ROOT}/${RUN_ID}"
+TARGET_RUN_NONEMPTY=false
 if [[ -d "${TARGET_RUN_DIR}" ]] && [[ -n "$(find "${TARGET_RUN_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+  TARGET_RUN_NONEMPTY=true
+fi
+if [[ "${TARGET_RUN_NONEMPTY}" == "true" && "${RESUME_IN_PLACE}" != "true" ]]; then
   echo "[ERROR] ${TARGET_RUN_DIR} already exists and is not empty; choose a new RUN_ID." >&2
   exit 3
+fi
+if [[ "${RESUME_IN_PLACE}" == "true" && "${LEGACY_WEIGHT_RESUME}" == "false" && "${FULL_STATE_RESUME}" == "false" ]]; then
+  shopt -s nullglob
+  FULL_STATE_MARKERS=(
+    "${TARGET_RUN_DIR}"/checkpoints/steps_*_training_state/trainer_state.json
+  )
+  shopt -u nullglob
+  if (( ${#FULL_STATE_MARKERS[@]} == 0 )); then
+    echo "[ERROR] No complete full training state was found under ${TARGET_RUN_DIR}/checkpoints." >&2
+    echo "A full-state resume requires a steps_*_training_state/trainer_state.json marker." >&2
+    exit 3
+  fi
+fi
+if [[ "${RESUME_IN_PLACE}" == "true" && "${LEGACY_WEIGHT_RESUME}" == "true" ]]; then
+  EXPECTED_RESUME_CHECKPOINT="${TARGET_RUN_DIR}/checkpoints/steps_${RESUME_STEP}_pytorch_model.pt"
+  if [[ ! -f "${EXPECTED_RESUME_CHECKPOINT}" ]]; then
+    echo "[ERROR] In-place resume checkpoint is missing: ${EXPECTED_RESUME_CHECKPOINT}" >&2
+    exit 3
+  fi
+  if [[ "$(readlink -f "${EXPECTED_RESUME_CHECKPOINT}")" != "$(readlink -f "${RESUME_CHECKPOINT}")" ]]; then
+    echo "[ERROR] RESUME_CHECKPOINT does not match the selected checkpoint inside ${TARGET_RUN_DIR}." >&2
+    exit 3
+  fi
+elif [[ "${LEGACY_WEIGHT_RESUME}" == "true" ]]; then
+  RESUME_LINK="${TARGET_RUN_DIR}/checkpoints/steps_${RESUME_STEP}_pytorch_model.pt"
+  mkdir -p "$(dirname "${RESUME_LINK}")"
+  ln -s "${RESUME_CHECKPOINT}" "${RESUME_LINK}"
 fi
 
 export WANDB_MODE="${WANDB_MODE:-online}"
@@ -135,17 +255,52 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "Processes=${NUM_PROCESSES} (maximum 2), watchdog GPUs=${WATCHDOG_GPUS}"
 echo "Accelerate main process port=${MAIN_PROCESS_PORT}"
 echo "Config=${CONFIG_YAML}"
+echo "Accelerate config=${ACCELERATE_CONFIG_FILE}"
 echo "Action initialization=${PRETRAINED_CHECKPOINT}"
 echo "Intent overlay=${S0_INTENT_CHECKPOINT}"
 echo "Output=${TARGET_RUN_DIR}"
-echo "S1=${STAGE1_STEPS}, S2=$((MAIN_MAX_STEPS - STAGE1_STEPS)), total=${MAIN_MAX_STEPS}"
-echo "Conditioning=timestep:false, query_film:true, ffn_film:true"
+echo "Prior E0 Action steps=${ACTION_STEP_OFFSET}"
+echo "S1=${STAGE1_STEPS}, S2=$((MAIN_MAX_STEPS - STAGE1_STEPS)), new steps=${MAIN_MAX_STEPS}, equivalent total=$((ACTION_STEP_OFFSET + MAIN_MAX_STEPS))"
+echo "Scheduler local steps=${SCHEDULER_TOTAL_STEPS}, warmup=${NUM_WARMUP_STEPS}"
+if [[ "${IS_RESUME}" == "true" ]]; then
+  if [[ "${LEGACY_WEIGHT_RESUME}" == "true" ]]; then
+    echo "Resume=legacy model weights at global step ${RESUME_STEP} from ${RESUME_CHECKPOINT}"
+    echo "Resume note=no full state was supplied; AdamW moments start fresh unless a newer complete training-state directory is found"
+  elif [[ "${FULL_STATE_RESUME}" == "true" ]]; then
+    echo "Resume=external full model/AdamW/scheduler/RNG state from ${RESUME_TRAINING_STATE}"
+  else
+    echo "Resume=latest complete full model/AdamW/scheduler/RNG state in ${TARGET_RUN_DIR}/checkpoints"
+  fi
+  echo "Resume in place=${RESUME_IN_PLACE}"
+fi
+echo "Per-device batch=${PER_DEVICE_BATCH_SIZE}, accumulation=${GRADIENT_ACCUMULATION_STEPS}, global batch=$((PER_DEVICE_BATCH_SIZE * NUM_PROCESSES * GRADIENT_ACCUMULATION_STEPS))"
+echo "Conditioning=see ${CONFIG_YAML}"
+
+TRAINER_OVERRIDES=()
+if [[ "${FULL_STATE_RESUME}" == "true" ]]; then
+  TRAINER_OVERRIDES+=(--trainer.resume_training_state "${RESUME_TRAINING_STATE}")
+fi
+if [[ -n "${WANDB_LOG_AFTER_STEP_OVERRIDE}" ]]; then
+  TRAINER_OVERRIDES+=(--trainer.wandb_log_after_step "${WANDB_LOG_AFTER_STEP_OVERRIDE}")
+fi
+if [[ -n "${RECOVERED_FROM_PHASE_STEP_OVERRIDE}" ]]; then
+  TRAINER_OVERRIDES+=(--trainer.recovered_from_phase_step "${RECOVERED_FROM_PHASE_STEP_OVERRIDE}")
+fi
+if [[ -n "${TRAINING_PHASE_ID_OVERRIDE}" ]]; then
+  TRAINER_OVERRIDES+=(--trainer.training_phase_id "${TRAINING_PHASE_ID_OVERRIDE}")
+fi
+
+if [[ "${CHECK_ONLY}" == "true" ]]; then
+  echo "CHECK_ONLY=true: configuration and required-path validation passed; training was not launched."
+  exit 0
+fi
 
 cd "${STARVLA_DIR}"
-accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+"${ACCELERATE_BIN}" launch \
+  --config_file "${ACCELERATE_CONFIG_FILE}" \
   --num_processes "${NUM_PROCESSES}" \
   --main_process_port "${MAIN_PROCESS_PORT}" \
+  --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
   starVLA/training/train_starvla.py \
   --config_yaml "${CONFIG_YAML}" \
   --framework.qwenvl.base_vlm "${BASE_VLM}" \
@@ -154,16 +309,21 @@ accelerate launch \
   --datasets.vla_data.per_device_batch_size "${PER_DEVICE_BATCH_SIZE}" \
   --trainer.pretrained_checkpoint "${PRETRAINED_CHECKPOINT}" \
   --trainer.intent_pretrained_checkpoint "${S0_INTENT_CHECKPOINT}" \
-  --trainer.is_resume false \
+  --trainer.is_resume "${IS_RESUME}" \
   --trainer.max_train_steps "${MAIN_MAX_STEPS}" \
-  --trainer.num_warmup_steps 5000 \
+  --trainer.scheduler_total_steps "${SCHEDULER_TOTAL_STEPS}" \
+  --trainer.scheduler_step_offset "${ACTION_STEP_OFFSET}" \
+  --trainer.wandb_step_offset "${ACTION_STEP_OFFSET}" \
+  --trainer.num_warmup_steps "${NUM_WARMUP_STEPS}" \
+  --trainer.gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
   --trainer.save_interval 5000 \
   --trainer.eval_interval 1000 \
   --trainer.repeated_diffusion_steps 16 \
   --run_root_dir "${CHECKPOINT_ROOT}" \
   --run_id "${RUN_ID}" \
   --wandb_project "${WANDB_PROJECT:-starVLA_Calvin_E1_Spatial_Intent_Main}" \
-  --wandb_entity "${WANDB_ENTITY:-chaikehang-sjtu-hpc-center}" &
+  --wandb_entity "${WANDB_ENTITY:-chaikehang-sjtu-hpc-center}" \
+  "${TRAINER_OVERRIDES[@]}" &
 
 TRAINING_PID=$!
 watchdog "${TRAINING_PID}" &

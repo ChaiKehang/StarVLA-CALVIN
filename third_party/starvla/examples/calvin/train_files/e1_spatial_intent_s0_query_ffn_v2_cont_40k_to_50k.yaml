@@ -1,13 +1,14 @@
-# E1 Spatial Intent v2 main experiment. S1 and S2 together consume exactly
-# 90k optimizer steps, matching E0's Action-update budget. The v2 Intent branch
-# must be overlaid from the matching S0 v2 run.
-run_id: e1_spatial_intent_query_ffn_v2_s1_s2_90k
+# V2 S0 low-LR continuation: warm-start model weights from the completed 40k
+# run, but deliberately start a fresh AdamW optimizer and 10k-step scheduler.
+# W&B logging is offset to 40k so it can continue the original run history.
+run_id: e1_spatial_intent_query_ffn_v2_s0_cont_40k_to_50k
+wandb_name: e1_spatial_intent_query_ffn_v2_s0_40000
 run_root_dir: /home/data/models/kehang-StarVLA/checkpoints/calvin
 seed: 42
-wandb_entity: disabled
-wandb_project: starVLA_Calvin_E1_Spatial_Intent_Main_V2
+wandb_entity: chaikehang-sjtu-hpc-center
+wandb_project: starVLA_Calvin_E1_Spatial_Intent_S0_V2
 is_debug: false
-version_id: "e1_spatial_intent_query_ffn_v2_s1_s2_v1"
+version_id: "e1_spatial_intent_query_ffn_v2_s0_cont_v1"
 
 framework:
   name: QwenPIIntent_v3
@@ -43,11 +44,12 @@ framework:
       attention_head_dim: 64
 
   intent:
-    training_stage: s1_s2
-    stage1_steps: 15000
+    training_stage: s0
     use_multilayer_aggregator: true
     source_layers: [4, 8, 12, 16, 20, 24, 28, 32, 36]
-    initialize_projectors_from_action: true
+    # The 40k checkpoint already contains trained Intent projectors. Recopying
+    # Action projector weights here would silently destroy that learned state.
+    initialize_projectors_from_action: false
     use_layer_position_embedding: true
 
     aggregator_block_type: query_ffn_v2
@@ -58,18 +60,14 @@ framework:
     query_attention_dropout: 0.0
     query_norm_eps: 1.0e-5
 
-    # Both Action-FiLM mechanisms consume the differentiable 125-way soft
-    # probability vector, not the unconstrained 1024-D aggregator feature.
     action_condition_source: probabilities
     return_attention_diagnostics: true
     attention_diagnostics_interval: 100
 
     use_aux_loss: true
     add_to_timestep_embedding: false
-    use_ffn_film: true
-    use_cross_attn_query_film: true
-    film_projector_type: mlp
-    film_hidden_dim: 256
+    use_ffn_film: false
+    use_cross_attn_query_film: false
     loss_weight: 0.1
     hidden_size: 1024
     num_attention_heads: 16
@@ -103,36 +101,40 @@ datasets:
     action_mode: abs
     action_type: calvin_scaled_rel_actions
     CoT_prompt: "Your task is {instruction}."
-    per_device_batch_size: 4
+    per_device_batch_size: 48
     load_all_data_for_training: true
     video_backend: torchvision_av
 
 trainer:
-  max_train_steps: 90000
-  num_warmup_steps: 5000
+  # This is a fresh local phase, not recover/resume. Local steps are 0..10k;
+  # W&B steps are 40k..50k through wandb_step_offset.
+  pretrained_checkpoint: /home/liuchang/kehang/488project/code/starvla/playground/Pretrained_models/kehang-StarVLA/checkpoints/calvin/e1_spatial_intent_query_ffn_v2_s0_40000/final_model/pytorch_model.pt
+  is_resume: false
+  max_train_steps: 10000
+  num_warmup_steps: 0
+  wandb_step_offset: 40000
+  training_phase_id: 1
+
   save_interval: 5000
   eval_interval: 1000
-  enable_action_eval: true
+  enable_action_eval: false
   repeated_diffusion_steps: 16
-  enable_intent_condition_probe: true
-  intent_condition_probe_seed: 42
 
   learning_rate:
-    base: 2.5e-05
-    intent_head.project_layers: 5.0e-05
-    intent_head.token_query_block.attention: 5.0e-05
-    intent_head.token_query_block.ffn: 5.0e-05
-    intent_head.layer_query_block.attention: 5.0e-05
-    intent_head.layer_query_block.ffn: 5.0e-05
-    intent_head.classifier: 1.0e-04
-    intent_head: 5.0e-05
-    action_model: 1.0e-04
+    base: 2.0e-06
+    intent_head.project_layers: 2.0e-06
+    intent_head.token_query_block.attention: 2.0e-06
+    intent_head.token_query_block.ffn: 2.0e-06
+    intent_head.layer_query_block.attention: 2.0e-06
+    intent_head.layer_query_block.ffn: 2.0e-06
+    intent_head.classifier: 4.0e-06
+    intent_head: 2.0e-06
 
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
-    min_lr: 1.0e-06
+    min_lr_rate: 0.25
 
-  freeze_modules: qwen_vl_interface
+  freeze_modules: qwen_vl_interface,action_model,project_layers,intent_to_timestep
   loss_scale:
     vla: 1.0
     vlm: 0.0
@@ -141,7 +143,7 @@ trainer:
   weight_decay: 0.0
   logging_frequency: 20
   gradient_clipping: 1.0
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
 
   optimizer:
     name: AdamW

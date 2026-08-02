@@ -76,6 +76,20 @@ class IntentHeadOutput:
 
 
 @dataclass
+class FactorizedIntentHeadOutput:
+    """Three semantically separated Intent predictions sharing token summaries."""
+
+    xyz_logits: torch.Tensor
+    rpy_logits: torch.Tensor
+    gripper_logits: torch.Tensor
+    xyz_features: torch.Tensor
+    rpy_features: torch.Tensor
+    gripper_features: torch.Tensor
+    token_attention_weights: Optional[torch.Tensor] = None
+    layer_attention_weights: Optional[dict[str, torch.Tensor]] = None
+
+
+@dataclass
 class QueryCrossAttentionBlockOutput:
     """Output and low-cost diagnostics for one learned-query block."""
 
@@ -670,4 +684,181 @@ class MultiLayerIntentClassificationHead(nn.Module):
                 if layer_block_output is not None
                 else None
             ),
+        )
+
+
+class FactorizedMultiLayerIntentClassificationHead(nn.Module):
+    """Predict translation, rotation, and gripper Intent from shared VLM summaries.
+
+    The nine source-layer projectors and token-query Transformer block are
+    shared.  Three independent layer-query Transformer blocks then produce
+    semantic features for 125-way XYZ, 125-way RPY, and 5-way gripper heads.
+    All parameters use their normal random initialization; no Action projector
+    weights are copied into this module.
+    """
+
+    HEAD_NAMES = ("xyz", "rpy", "gripper")
+
+    def __init__(
+        self,
+        *,
+        input_hidden_size: int,
+        source_layers: Sequence[int],
+        hidden_size: int = 1024,
+        num_attention_heads: int = 16,
+        xyz_rpy_classifier_hidden_size: int = 512,
+        gripper_classifier_hidden_size: int = 256,
+        dropout: float = 0.1,
+        use_layer_position_embedding: bool = True,
+        query_ffn_multiplier: float = 2.0,
+        query_ffn_dropout: float = 0.1,
+        query_attention_dropout: float = 0.05,
+        query_norm_eps: float = 1.0e-5,
+    ) -> None:
+        super().__init__()
+        self.input_hidden_size = int(input_hidden_size)
+        self.hidden_size = int(hidden_size)
+        self.source_layers = tuple(int(layer) for layer in source_layers)
+        if not self.source_layers or len(set(self.source_layers)) != len(self.source_layers):
+            raise ValueError("source_layers must contain unique layer numbers")
+        if any(layer <= 0 for layer in self.source_layers):
+            raise ValueError("source_layers use 1-based positive layer numbers")
+        if self.hidden_size % int(num_attention_heads) != 0:
+            raise ValueError("hidden_size must be divisible by num_attention_heads")
+
+        self.project_layers = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.LayerNorm(self.input_hidden_size, eps=query_norm_eps),
+                    nn.Linear(self.input_hidden_size, self.hidden_size),
+                )
+                for _ in self.source_layers
+            ]
+        )
+        self.token_queries = nn.Parameter(
+            torch.empty(len(self.source_layers), 1, self.hidden_size)
+        )
+        self.token_query_block = LearnedQueryCrossAttentionBlock(
+            hidden_size=self.hidden_size,
+            num_attention_heads=int(num_attention_heads),
+            use_ffn=True,
+            ffn_multiplier=query_ffn_multiplier,
+            ffn_dropout=query_ffn_dropout,
+            attention_dropout=query_attention_dropout,
+            norm_eps=query_norm_eps,
+        )
+        if use_layer_position_embedding:
+            self.layer_position_embedding = nn.Parameter(
+                torch.empty(len(self.source_layers), self.hidden_size)
+            )
+        else:
+            self.register_parameter("layer_position_embedding", None)
+
+        self.layer_queries = nn.ParameterDict(
+            {
+                name: nn.Parameter(torch.empty(1, 1, self.hidden_size))
+                for name in self.HEAD_NAMES
+            }
+        )
+        self.layer_query_blocks = nn.ModuleDict(
+            {
+                name: LearnedQueryCrossAttentionBlock(
+                    hidden_size=self.hidden_size,
+                    num_attention_heads=int(num_attention_heads),
+                    use_ffn=True,
+                    ffn_multiplier=query_ffn_multiplier,
+                    ffn_dropout=query_ffn_dropout,
+                    attention_dropout=query_attention_dropout,
+                    norm_eps=query_norm_eps,
+                )
+                for name in self.HEAD_NAMES
+            }
+        )
+
+        def classifier(hidden: int, classes: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.LayerNorm(self.hidden_size, eps=query_norm_eps),
+                nn.Linear(self.hidden_size, hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, classes),
+            )
+
+        self.xyz_classifier = classifier(xyz_rpy_classifier_hidden_size, 125)
+        self.rpy_classifier = classifier(xyz_rpy_classifier_hidden_size, 125)
+        self.gripper_classifier = classifier(gripper_classifier_hidden_size, 5)
+
+        query_std = self.hidden_size**-0.5
+        nn.init.normal_(self.token_queries, mean=0.0, std=query_std)
+        for query in self.layer_queries.values():
+            nn.init.normal_(query, mean=0.0, std=query_std)
+        if self.layer_position_embedding is not None:
+            nn.init.normal_(self.layer_position_embedding, mean=0.0, std=query_std)
+
+    def forward(
+        self,
+        hidden_states_by_layer: Sequence[torch.Tensor],
+        attention_mask: torch.Tensor,
+        return_attention_weights: bool = False,
+    ) -> FactorizedIntentHeadOutput:
+        if len(hidden_states_by_layer) != len(self.source_layers):
+            raise ValueError(
+                f"Expected {len(self.source_layers)} source layers, "
+                f"got {len(hidden_states_by_layer)}"
+            )
+
+        summaries = []
+        token_weights = []
+        for index, (hidden_states, projector) in enumerate(
+            zip(hidden_states_by_layer, self.project_layers)
+        ):
+            valid_mask = _validate_and_convert_mask(
+                hidden_states, attention_mask, self.input_hidden_size
+            )
+            projected = projector(hidden_states)
+            query = self.token_queries[index : index + 1].expand(
+                projected.shape[0], -1, -1
+            )
+            block_output = self.token_query_block(
+                query,
+                projected,
+                key_padding_mask=~valid_mask,
+                return_attention_weights=return_attention_weights,
+            )
+            summaries.append(block_output.hidden_states[:, 0])
+            if return_attention_weights:
+                token_weights.append(block_output.attention_weights[:, 0])
+
+        layer_summaries = torch.stack(summaries, dim=1)
+        if self.layer_position_embedding is not None:
+            layer_summaries = layer_summaries + self.layer_position_embedding[
+                None
+            ].to(dtype=layer_summaries.dtype)
+
+        features = {}
+        layer_weights = {}
+        for name in self.HEAD_NAMES:
+            query = self.layer_queries[name].expand(
+                layer_summaries.shape[0], -1, -1
+            )
+            block_output = self.layer_query_blocks[name](
+                query,
+                layer_summaries,
+                return_attention_weights=return_attention_weights,
+            )
+            features[name] = block_output.hidden_states[:, 0]
+            if return_attention_weights:
+                layer_weights[name] = block_output.attention_weights[:, 0]
+
+        return FactorizedIntentHeadOutput(
+            xyz_logits=self.xyz_classifier(features["xyz"]),
+            rpy_logits=self.rpy_classifier(features["rpy"]),
+            gripper_logits=self.gripper_classifier(features["gripper"]),
+            xyz_features=features["xyz"],
+            rpy_features=features["rpy"],
+            gripper_features=features["gripper"],
+            token_attention_weights=(
+                torch.stack(token_weights, dim=1) if token_weights else None
+            ),
+            layer_attention_weights=layer_weights or None,
         )

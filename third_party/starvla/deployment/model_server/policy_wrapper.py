@@ -128,6 +128,12 @@ class PolicyServerWrapper:
                 "use_cross_attn_query_film": bool(
                     intent_cfg.get("use_cross_attn_query_film", False)
                 ),
+                "query_film_layers": list(
+                    intent_cfg.get("query_film_layers", [])
+                ),
+                "use_entropy_confidence_gate": bool(
+                    intent_cfg.get("use_entropy_confidence_gate", False)
+                ),
             }
         # Enrich with per-embodiment keys when a default processor already exists.
         if self._default_unnorm_key is not None:

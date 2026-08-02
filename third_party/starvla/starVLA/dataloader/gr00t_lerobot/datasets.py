@@ -909,7 +909,11 @@ class LeRobotSingleDataset(Dataset):
             for episode in episode_metadata:
                 trajectory_ids.append(episode["episode_index"])
                 trajectory_lengths.append(episode["length"])
-            return np.array(trajectory_ids), np.array(trajectory_lengths)
+            trajectory_ids = np.array(trajectory_ids)
+            trajectory_lengths = np.array(trajectory_lengths)
+            return self._filter_trajectories_from_manifest(
+                trajectory_ids, trajectory_lengths
+            )
         # v3.0
         elif self._lerobot_version == "v3.0":
             file_paths = sorted(list((self.dataset_path).glob(LE_ROBOT3_EPISODE_FILENAME)))
@@ -969,7 +973,63 @@ class LeRobotSingleDataset(Dataset):
                     self.trajectory_ids_to_metadata[trajectory_ids[-1]] = episode_meta
 
             # Should be able to directly read the saved index info here
-            return np.array(trajectory_ids), np.array(trajectory_lengths)
+            trajectory_ids = np.array(trajectory_ids)
+            trajectory_lengths = np.array(trajectory_lengths)
+            return self._filter_trajectories_from_manifest(
+                trajectory_ids, trajectory_lengths
+            )
+
+    def _filter_trajectories_from_manifest(
+        self,
+        trajectory_ids: np.ndarray,
+        trajectory_lengths: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply an optional episode-ID manifest without copying dataset files."""
+
+        if self.data_cfg is None:
+            return trajectory_ids, trajectory_lengths
+        manifest_value = self.data_cfg.get("trajectory_manifest", None)
+        if not manifest_value:
+            return trajectory_ids, trajectory_lengths
+        manifest_path = Path(str(manifest_value)).expanduser()
+        if not manifest_path.is_absolute():
+            manifest_path = self.dataset_path / manifest_path
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"trajectory_manifest does not exist: {manifest_path}"
+            )
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        selected = manifest.get("episode_ids", manifest)
+        if not isinstance(selected, list) or not selected:
+            raise ValueError(
+                f"trajectory manifest must contain a non-empty episode_ids list: "
+                f"{manifest_path}"
+            )
+        selected_ids = {int(value) for value in selected}
+        available_ids = {int(value) for value in trajectory_ids.tolist()}
+        missing = selected_ids - available_ids
+        if missing:
+            raise ValueError(
+                f"trajectory manifest contains unavailable episode IDs: "
+                f"{sorted(missing)[:10]}"
+            )
+        keep = np.asarray(
+            [int(value) in selected_ids for value in trajectory_ids],
+            dtype=bool,
+        )
+        filtered_ids = trajectory_ids[keep]
+        filtered_lengths = trajectory_lengths[keep]
+        if len(filtered_ids) != len(selected_ids):
+            raise ValueError(
+                "trajectory manifest contains duplicate or unresolved episode IDs"
+            )
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                f"Applied trajectory manifest {manifest_path}: "
+                f"{len(filtered_ids)}/{len(trajectory_ids)} episodes"
+            )
+        return filtered_ids, filtered_lengths
 
     def _get_all_steps(self) -> list[tuple[int, int]]:
         """Get the trajectory IDs and base indices for all steps in the dataset.
@@ -981,7 +1041,11 @@ class LeRobotSingleDataset(Dataset):
             return (not dist.is_initialized()) or dist.get_rank() == 0
     
         config_key = self._get_steps_config_key()
-        steps_filename = "steps_data_index.pkl"
+        steps_filename = (
+            "steps_data_index.pkl"
+            if not (self.data_cfg and self.data_cfg.get("trajectory_manifest", None))
+            else f"steps_data_index_{config_key}.pkl"
+        )
         steps_path = self.dataset_path / "meta" / steps_filename
     
         # ---------- try to read from cache  ----------
@@ -1034,6 +1098,11 @@ class LeRobotSingleDataset(Dataset):
         config_dict = {
             "delete_pause_frame": self.delete_pause_frame,
             "dataset_name": self.dataset_name,
+            "trajectory_manifest": (
+                str(self.data_cfg.get("trajectory_manifest", ""))
+                if self.data_cfg is not None
+                else ""
+            ),
         }
         # Create a hash of the configuration
         config_str = str(sorted(config_dict.items()))
@@ -1419,6 +1488,13 @@ class LeRobotSingleDataset(Dataset):
         # indices, while intent.class_id is already the final class target.
         if "intent_class_id" in data:
             sample["intent_class_id"] = int(data["intent_class_id"])
+        for sample_key in (
+            "intent_xyz_class_id",
+            "intent_rpy_class_id",
+            "intent_gripper_class_id",
+        ):
+            if sample_key in data:
+                sample[sample_key] = int(data[sample_key])
 
         return sample
 
@@ -1458,6 +1534,47 @@ class LeRobotSingleDataset(Dataset):
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
 
         if self.data_cfg is not None and self.data_cfg.get("include_intent", False) not in ["False", False]:
+            if self.data_cfg.get("factorized_intent", False):
+                column_map = {
+                    "intent_xyz_class_id": self.data_cfg.get(
+                        "intent_xyz_class_column", "intent.xyz_class_id"
+                    ),
+                    "intent_rpy_class_id": self.data_cfg.get(
+                        "intent_rpy_class_column", "intent.rpy_class_id"
+                    ),
+                    "intent_gripper_class_id": self.data_cfg.get(
+                        "intent_gripper_class_column", "intent.gripper_class_id"
+                    ),
+                }
+                class_counts = {
+                    "intent_xyz_class_id": 125,
+                    "intent_rpy_class_id": 125,
+                    "intent_gripper_class_id": 5,
+                }
+                for sample_key, column in column_map.items():
+                    if column not in self.curr_traj_data.columns:
+                        raise KeyError(
+                            f"factorized_intent=True but parquet column "
+                            f"{column!r} is missing from {self.dataset_name!r}"
+                        )
+                    raw_value = np.asarray(
+                        self.curr_traj_data[column].iloc[base_index]
+                    )
+                    if raw_value.size != 1:
+                        raise ValueError(
+                            f"Expected scalar class in {column!r}, "
+                            f"got {raw_value.shape}"
+                        )
+                    value = int(raw_value.reshape(-1)[0])
+                    if not 0 <= value < class_counts[sample_key]:
+                        raise ValueError(
+                            f"{column} must be in [0,{class_counts[sample_key]-1}], "
+                            f"got {value}"
+                        )
+                    data[sample_key] = value
+                data = self._apply_action_mode(data)
+                return data
+
             intent_column = self.data_cfg.get("intent_class_column", "intent.class_id")
             if intent_column not in self.curr_traj_data.columns:
                 raise KeyError(

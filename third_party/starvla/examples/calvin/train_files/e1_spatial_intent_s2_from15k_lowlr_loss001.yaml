@@ -1,13 +1,13 @@
-# E1 Spatial Intent v2 main experiment. S1 and S2 together consume exactly
-# 90k optimizer steps, matching E0's Action-update budget. The v2 Intent branch
-# must be overlaid from the matching S0 v2 run.
-run_id: e1_spatial_intent_query_ffn_v2_s1_s2_90k
+# E1 Spatial Intent v2 low-LR branch from the main-run 15k checkpoint.
+# The launcher installs the selected checkpoint into a new run directory and
+# resumes the global step at 15k, so the first new forward is S2.
+run_id: e1_spatial_intent_query_ffn_v2_s2_from15k_lowlr_loss001
 run_root_dir: /home/data/models/kehang-StarVLA/checkpoints/calvin
 seed: 42
 wandb_entity: disabled
 wandb_project: starVLA_Calvin_E1_Spatial_Intent_Main_V2
 is_debug: false
-version_id: "e1_spatial_intent_query_ffn_v2_s1_s2_v1"
+version_id: "e1_spatial_intent_query_ffn_v2_s2_from15k_lowlr_loss001_v1"
 
 framework:
   name: QwenPIIntent_v3
@@ -58,8 +58,6 @@ framework:
     query_attention_dropout: 0.0
     query_norm_eps: 1.0e-5
 
-    # Both Action-FiLM mechanisms consume the differentiable 125-way soft
-    # probability vector, not the unconstrained 1024-D aggregator feature.
     action_condition_source: probabilities
     return_attention_diagnostics: true
     attention_diagnostics_interval: 100
@@ -70,7 +68,7 @@ framework:
     use_cross_attn_query_film: true
     film_projector_type: mlp
     film_hidden_dim: 256
-    loss_weight: 0.1
+    loss_weight: 0.01
     hidden_size: 1024
     num_attention_heads: 16
     classifier_hidden_size: 512
@@ -119,18 +117,20 @@ trainer:
 
   learning_rate:
     base: 2.5e-05
-    intent_head.project_layers: 5.0e-05
-    intent_head.token_query_block.attention: 5.0e-05
-    intent_head.token_query_block.ffn: 5.0e-05
-    intent_head.layer_query_block.attention: 5.0e-05
-    intent_head.layer_query_block.ffn: 5.0e-05
-    intent_head.classifier: 1.0e-04
-    intent_head: 5.0e-05
+    intent_head.project_layers: 1.0e-06
+    intent_head.token_query_block.attention: 1.0e-06
+    intent_head.token_query_block.ffn: 1.0e-06
+    intent_head.layer_query_block.attention: 1.0e-06
+    intent_head.layer_query_block.ffn: 1.0e-06
+    intent_head.classifier: 2.0e-06
+    intent_head: 1.0e-06
     action_model: 1.0e-04
 
   lr_scheduler_type: cosine_with_min_lr
+  # Use the same normalized cosine floor as the original run. A relative
+  # floor is explicit here because optimizer groups have different peak LRs.
   scheduler_specific_kwargs:
-    min_lr: 1.0e-06
+    min_lr_rate: 0.04
 
   freeze_modules: qwen_vl_interface
   loss_scale:

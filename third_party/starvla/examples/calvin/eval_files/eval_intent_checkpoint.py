@@ -38,6 +38,21 @@ def classification_metrics(
 ) -> dict:
     probabilities = np.asarray(probabilities, dtype=np.float64)
     targets = np.asarray(targets, dtype=np.int64)
+    if probabilities.ndim != 2 or probabilities.shape[1] != 125:
+        raise ValueError(
+            "probabilities must have shape [num_samples, 125], got "
+            f"{probabilities.shape}"
+        )
+    if targets.ndim != 1 or len(targets) != len(probabilities):
+        raise ValueError(
+            "targets must have shape [num_samples] matching probabilities, got "
+            f"{targets.shape} for {len(probabilities)} probability rows"
+        )
+    if len(targets) == 0:
+        raise ValueError("at least one labeled sample is required")
+    if np.any((targets < 0) | (targets >= 125)):
+        raise ValueError("targets must contain class IDs in [0, 124]")
+
     predictions = probabilities.argmax(axis=-1)
     top5 = np.argpartition(probabilities, -5, axis=-1)[:, -5:]
     eps = np.finfo(np.float64).tiny
@@ -69,6 +84,35 @@ def classification_metrics(
 
     target_bins = decode_classes(targets)
     predicted_bins = decode_classes(predictions)
+    top5_bins = decode_classes(top5.reshape(-1)).reshape(len(targets), 5, 3)
+
+    # A joint class ID is a flattened coordinate in a 5x5x5 ordinal grid.
+    # Distances must therefore be computed after decoding, never by subtracting
+    # class IDs (e.g. IDs 64 and 65 are numerically adjacent but spatially far).
+    top1_bin_delta = np.abs(target_bins - predicted_bins)
+    top1_manhattan = top1_bin_delta.sum(axis=-1)
+    top1_chebyshev = top1_bin_delta.max(axis=-1)
+
+    top5_bin_delta = np.abs(target_bins[:, None, :] - top5_bins)
+    top5_manhattan = top5_bin_delta.sum(axis=-1)
+    top5_chebyshev = top5_bin_delta.max(axis=-1)
+    top5_min_manhattan = top5_manhattan.min(axis=-1)
+    top5_min_chebyshev = top5_chebyshev.min(axis=-1)
+
+    # Use the complete probability distribution as well as Top-1/Top-5. This
+    # distinguishes a spatially coherent uncertain prediction from probability
+    # mass assigned to distant regions of the grid.
+    all_class_bins = decode_classes(np.arange(125, dtype=np.int64))
+    all_class_delta = np.abs(
+        target_bins[:, None, :] - all_class_bins[None, :, :]
+    )
+    all_class_manhattan = all_class_delta.sum(axis=-1)
+    all_class_chebyshev = all_class_delta.max(axis=-1)
+    expected_manhattan = (probabilities * all_class_manhattan).sum(axis=-1)
+    neighborhood_probability_mass = (
+        probabilities * (all_class_chebyshev <= 1)
+    ).sum(axis=-1)
+
     axis_confusions = []
     axis_accuracies = []
     axis_mean_distances = []
@@ -86,19 +130,59 @@ def classification_metrics(
     entropy = -(probabilities * np.log(np.clip(probabilities, eps, None))).sum(
         axis=-1
     )
+    exact_top1_accuracy = float(np.mean(predictions == targets))
+    exact_top5_accuracy = float(np.mean(np.any(top5 == targets[:, None], axis=1)))
+    top1_mean_manhattan_distance = float(top1_manhattan.mean())
     return {
         "num_samples": int(len(targets)),
         "cross_entropy": float(
             -np.log(np.clip(probabilities[np.arange(len(targets)), targets], eps, None)).mean()
         ),
-        "top1_accuracy": float(np.mean(predictions == targets)),
-        "top5_accuracy": float(np.mean(np.any(top5 == targets[:, None], axis=1))),
+        # Keep the legacy names while exposing explicit exact-match names next
+        # to the new spatial-neighborhood metrics.
+        "top1_accuracy": exact_top1_accuracy,
+        "top5_accuracy": exact_top5_accuracy,
+        "exact_top1_accuracy": exact_top1_accuracy,
+        "exact_top5_accuracy": exact_top5_accuracy,
         "balanced_accuracy_supported_classes": float(recall[supported].mean()),
         "macro_f1_supported_classes": float(f1[supported].mean()),
         "occupied_target_classes": int(supported.sum()),
-        "mean_bin_manhattan_distance": float(
-            np.abs(target_bins - predicted_bins).sum(axis=-1).mean()
+        "mean_bin_manhattan_distance": top1_mean_manhattan_distance,
+        "top1_mean_manhattan_distance": top1_mean_manhattan_distance,
+        "top1_mean_chebyshev_distance": float(top1_chebyshev.mean()),
+        "top1_within_manhattan_1_accuracy": float(
+            np.mean(top1_manhattan <= 1)
         ),
+        "top1_within_chebyshev_1_accuracy": float(
+            np.mean(top1_chebyshev <= 1)
+        ),
+        "top5_min_manhattan_distance": float(top5_min_manhattan.mean()),
+        "top5_min_chebyshev_distance": float(top5_min_chebyshev.mean()),
+        "top5_within_manhattan_1_accuracy": float(
+            np.mean(top5_min_manhattan <= 1)
+        ),
+        "top5_within_chebyshev_1_accuracy": float(
+            np.mean(top5_min_chebyshev <= 1)
+        ),
+        "top5_near_fraction_chebyshev_1": float(
+            np.mean(top5_chebyshev <= 1)
+        ),
+        "expected_manhattan_distance": float(expected_manhattan.mean()),
+        "probability_mass_within_chebyshev_1": float(
+            neighborhood_probability_mass.mean()
+        ),
+        "top1_manhattan_distance_histogram": np.bincount(
+            top1_manhattan, minlength=13
+        ).tolist(),
+        "top1_chebyshev_distance_histogram": np.bincount(
+            top1_chebyshev, minlength=5
+        ).tolist(),
+        "top5_min_manhattan_distance_histogram": np.bincount(
+            top5_min_manhattan, minlength=13
+        ).tolist(),
+        "top5_min_chebyshev_distance_histogram": np.bincount(
+            top5_min_chebyshev, minlength=5
+        ).tolist(),
         "per_axis_accuracy": dict(zip(("x", "y", "z"), axis_accuracies)),
         "per_axis_mean_bin_distance": dict(
             zip(("x", "y", "z"), axis_mean_distances)

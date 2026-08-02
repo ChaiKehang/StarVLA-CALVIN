@@ -9,6 +9,7 @@ import torch
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.VLM4A.QwenPI_v3 import Qwen_PI_v3
 from starVLA.model.modules.intent_head import (
+    FactorizedMultiLayerIntentClassificationHead,
     IntentClassificationHead,
     IntentHeadConfig,
     MultiLayerIntentClassificationHead,
@@ -44,15 +45,36 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
         self.use_cross_attn_query_film = bool(
             intent_cfg.get("use_cross_attn_query_film", False)
         )
+        query_film_layers = intent_cfg.get("query_film_layers", None)
+        self.query_film_layers = (
+            tuple(int(layer) for layer in query_film_layers)
+            if query_film_layers is not None
+            else None
+        )
+        self.use_entropy_confidence_gate = bool(
+            intent_cfg.get("use_entropy_confidence_gate", False)
+        )
+        self.intent_film_projector_type = str(
+            intent_cfg.get("film_projector_type", "linear")
+        ).lower()
+        if self.intent_film_projector_type not in {"linear", "mlp"}:
+            raise ValueError(
+                "framework.intent.film_projector_type must be linear or mlp, "
+                f"got {self.intent_film_projector_type!r}"
+            )
+        self.intent_film_hidden_dim = int(intent_cfg.get("film_hidden_dim", 256))
+        if self.intent_film_hidden_dim <= 0:
+            raise ValueError("framework.intent.film_hidden_dim must be positive")
         self.use_multilayer_intent = bool(
             intent_cfg.get("use_multilayer_aggregator", False)
         )
+        self.use_factorized_intent = bool(intent_cfg.get("factorized", False))
         self.intent_action_condition_source = str(
             intent_cfg.get("action_condition_source", "probabilities")
         )
         if self.intent_action_condition_source != "probabilities":
             raise ValueError(
-                "Only the controlled 125-way soft-probability Action interface is "
+                "Only the controlled soft-probability Action interface is "
                 "implemented; framework.intent.action_condition_source must be "
                 f"'probabilities', got {self.intent_action_condition_source!r}"
             )
@@ -99,7 +121,39 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
                 f"source_layers={source_layers}, available={self.num_action_dit_layers}"
             )
         self.intent_source_layers = source_layers
-        if self.use_multilayer_intent:
+        if self.use_factorized_intent:
+            if not self.use_multilayer_intent:
+                raise ValueError("factorized Intent requires use_multilayer_aggregator=true")
+            vlm_hidden_size = int(self.config.framework.qwenvl.vl_hidden_dim)
+            self.intent_head = FactorizedMultiLayerIntentClassificationHead(
+                input_hidden_size=vlm_hidden_size,
+                source_layers=source_layers,
+                hidden_size=intent_hidden_size,
+                num_attention_heads=int(
+                    intent_cfg.get("num_attention_heads", 16)
+                ),
+                xyz_rpy_classifier_hidden_size=int(
+                    intent_cfg.get("classifier_hidden_size", 512)
+                ),
+                gripper_classifier_hidden_size=int(
+                    intent_cfg.get("gripper_classifier_hidden_size", 256)
+                ),
+                dropout=float(intent_cfg.get("dropout", 0.1)),
+                use_layer_position_embedding=bool(
+                    intent_cfg.get("use_layer_position_embedding", True)
+                ),
+                query_ffn_multiplier=float(
+                    intent_cfg.get("query_ffn_multiplier", 2.0)
+                ),
+                query_ffn_dropout=float(
+                    intent_cfg.get("query_ffn_dropout", 0.1)
+                ),
+                query_attention_dropout=float(
+                    intent_cfg.get("query_attention_dropout", 0.05)
+                ),
+                query_norm_eps=float(intent_cfg.get("query_norm_eps", 1.0e-5)),
+            )
+        elif self.use_multilayer_intent:
             vlm_hidden_size = int(self.config.framework.qwenvl.vl_hidden_dim)
             self.intent_head = MultiLayerIntentClassificationHead(
                 input_hidden_size=vlm_hidden_size,
@@ -130,14 +184,35 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
             )
         else:
             self.intent_head = IntentClassificationHead(head_config)
+        self.intent_condition_size = 255 if self.use_factorized_intent else num_classes
         self.intent_to_timestep = build_zero_initialized_intent_projection(
-            num_classes, self.action_dit_hidden_dim
+            self.intent_condition_size, self.action_dit_hidden_dim
         )
         self.intent_num_classes = num_classes
         if self.use_ffn_intent_film:
-            self.action_model.model.enable_ffn_intent_film(num_classes)
+            self.action_model.model.enable_ffn_intent_film(
+                num_classes,
+                projector_type=self.intent_film_projector_type,
+                hidden_dim=self.intent_film_hidden_dim,
+            )
         if self.use_cross_attn_query_film:
-            self.action_model.model.enable_cross_attn_query_intent_film(num_classes)
+            self.action_model.model.enable_cross_attn_query_intent_film(
+                self.intent_condition_size,
+                projector_type=self.intent_film_projector_type,
+                hidden_dim=self.intent_film_hidden_dim,
+                layer_numbers=self.query_film_layers,
+                output_bias=self.use_factorized_intent,
+                modulation_bound=(
+                    float(intent_cfg.get("query_film_modulation_bound", 0.2))
+                    if self.use_factorized_intent
+                    else None
+                ),
+            )
+        self.intent_condition_dropout = float(
+            intent_cfg.get("condition_dropout", 0.0)
+        )
+        if not 0.0 <= self.intent_condition_dropout < 1.0:
+            raise ValueError("framework.intent.condition_dropout must be in [0,1)")
 
     @property
     def intent_project_layers(self):
@@ -219,6 +294,65 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
                 mask,
                 return_attention_weights=return_attention_weights,
             )
+        if self.use_factorized_intent:
+            logits = {
+                "xyz": intent_output.xyz_logits,
+                "rpy": intent_output.rpy_logits,
+                "gripper": intent_output.gripper_logits,
+            }
+            probabilities_by_head = {
+                name: torch.softmax(value.float(), dim=-1).to(
+                    dtype=self.intent_to_timestep.weight.dtype
+                )
+                for name, value in logits.items()
+            }
+            probabilities = torch.cat(
+                [
+                    probabilities_by_head["xyz"],
+                    probabilities_by_head["rpy"],
+                    probabilities_by_head["gripper"],
+                ],
+                dim=-1,
+            )
+            diagnostics = {}
+            for name, features in (
+                ("xyz", intent_output.xyz_features),
+                ("rpy", intent_output.rpy_features),
+                ("gripper", intent_output.gripper_features),
+            ):
+                diagnostics[f"intent_{name}_feature_l2_mean"] = (
+                    features.float().norm(dim=-1).mean().detach()
+                )
+                head_metrics = self._intent_probability_metrics(
+                    probabilities_by_head[name]
+                )
+                diagnostics[f"intent_{name}_probability_entropy"] = head_metrics[
+                    "intent_probability_entropy"
+                ]
+                diagnostics[f"intent_{name}_max_probability"] = head_metrics[
+                    "intent_max_probability"
+                ]
+            if intent_output.layer_attention_weights is not None:
+                for head_name, weights in intent_output.layer_attention_weights.items():
+                    weights = weights.float()
+                    safe = weights.clamp_min(torch.finfo(torch.float32).tiny)
+                    diagnostics[f"intent_{head_name}_layer_attention_entropy"] = (
+                        -(weights * safe.log()).sum(dim=-1).mean().detach()
+                    )
+                    for index, source_layer in enumerate(self.intent_source_layers):
+                        diagnostics[
+                            f"intent_{head_name}_layer_attention_weight_{source_layer}"
+                        ] = weights[:, index].mean().detach()
+            if intent_output.token_attention_weights is not None:
+                weights = intent_output.token_attention_weights.float()
+                safe = weights.clamp_min(torch.finfo(torch.float32).tiny)
+                entropy = -(weights * safe.log()).sum(dim=-1).mean(dim=0)
+                for index, source_layer in enumerate(self.intent_source_layers):
+                    diagnostics[f"intent_token_attention_entropy_{source_layer}"] = (
+                        entropy[index].detach()
+                    )
+            return logits, probabilities, diagnostics
+
         # Compute softmax in fp32 for numerical stability, then cast to the
         # projection weight dtype without detaching the intent-head graph.
         probabilities = torch.softmax(intent_output.logits.float(), dim=-1).to(
@@ -279,6 +413,27 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
                 )
         return intent_output.logits, probabilities, diagnostics
 
+    def _intent_film_confidence(
+        self, probabilities: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Return detached linear normalized-entropy confidence per sample."""
+
+        if not self.use_entropy_confidence_gate:
+            return None
+        eps = torch.finfo(torch.float32).eps
+        probabilities_fp32 = probabilities.float()
+        probability_mass = probabilities_fp32.sum(dim=-1, keepdim=True)
+        normalized = probabilities_fp32 / probability_mass.clamp_min(eps)
+        entropy = -(
+            normalized * normalized.clamp_min(eps).log()
+        ).sum(dim=-1)
+        max_entropy = float(np.log(self.intent_num_classes))
+        confidence = (1.0 - entropy / max_entropy).clamp(0.0, 1.0)
+        confidence = confidence * (probability_mass[:, 0] > eps).to(
+            confidence.dtype
+        )
+        return confidence.detach()
+
     def _select_intent_hidden_states(
         self,
         raw_vl_embs_list: List[torch.Tensor],
@@ -291,6 +446,33 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
         return projected_vl_embs_list[-1]
 
     def _intent_targets(self, examples: List[dict], device: torch.device) -> torch.Tensor:
+        if self.use_factorized_intent:
+            keys = {
+                "xyz": "intent_xyz_class_id",
+                "rpy": "intent_rpy_class_id",
+                "gripper": "intent_gripper_class_id",
+            }
+            targets = {}
+            for name, key in keys.items():
+                missing = [
+                    index for index, example in enumerate(examples) if key not in example
+                ]
+                if missing:
+                    raise KeyError(
+                        f"factorized Intent requires {key} in every sample; "
+                        f"missing at batch indices {missing[:8]}"
+                    )
+                values = torch.as_tensor(
+                    [int(example[key]) for example in examples],
+                    device=device,
+                    dtype=torch.long,
+                )
+                classes = 5 if name == "gripper" else 125
+                if torch.any((values < 0) | (values >= classes)):
+                    raise ValueError(f"{key} must be in [0,{classes - 1}]")
+                targets[name] = values
+            return targets
+
         missing = [index for index, example in enumerate(examples) if "intent_class_id" not in example]
         if missing:
             raise KeyError(
@@ -308,6 +490,38 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
                 f"intent_class_id must be in [0, {self.intent_num_classes - 1}], got {bad}"
             )
         return targets
+
+    def _factorized_intent_loss(
+        self,
+        logits: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+        *,
+        loss_weight: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        losses = {
+            name: torch.nn.functional.cross_entropy(
+                logits[name].float(), targets[name]
+            )
+            for name in ("xyz", "rpy", "gripper")
+        }
+        unweighted = losses["xyz"] + losses["rpy"] + 0.5 * losses["gripper"]
+        metrics = {}
+        for name in ("xyz", "rpy", "gripper"):
+            prediction = logits[name].argmax(dim=-1)
+            metrics[f"intent_{name}_loss"] = losses[name]
+            metrics[f"intent_{name}_top1_accuracy"] = (
+                prediction == targets[name]
+            ).float().mean().detach()
+            metrics[f"intent_{name}_top5_accuracy"] = (
+                logits[name]
+                .topk(k=min(5, logits[name].shape[-1]), dim=-1)
+                .indices.eq(targets[name][:, None])
+                .any(dim=-1)
+                .float()
+                .mean()
+                .detach()
+            )
+        return unweighted, unweighted * loss_weight, metrics
 
     def _repeat_count(self) -> int:
         trainer_cfg = self.config.trainer if self.config and self.config.trainer else None
@@ -371,6 +585,35 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
             "max_probability": top_probabilities[:, 0].detach().cpu().numpy(),
         }
 
+    def _format_factorized_intent_predictions(
+        self, probabilities: torch.Tensor
+    ) -> dict[str, np.ndarray]:
+        if probabilities.ndim != 2 or probabilities.shape[-1] != 255:
+            raise ValueError(
+                "factorized probabilities must have shape [B,255], "
+                f"got {tuple(probabilities.shape)}"
+            )
+        xyz, rpy, gripper = torch.split(probabilities, [125, 125, 5], dim=-1)
+        output = {}
+        for name, values in (("xyz", xyz), ("rpy", rpy)):
+            formatted = self._format_intent_predictions(values)
+            output.update({f"{name}_{key}": value for key, value in formatted.items()})
+        gripper_top_probabilities, gripper_top_ids = gripper.float().topk(5, dim=-1)
+        output.update(
+            {
+                "gripper_probabilities": gripper.float().detach().cpu().numpy(),
+                "gripper_predicted_class_id": gripper_top_ids[:, 0]
+                .detach()
+                .cpu()
+                .numpy(),
+                "gripper_top5_class_ids": gripper_top_ids.detach().cpu().numpy(),
+                "gripper_top5_probabilities": gripper_top_probabilities.detach()
+                .cpu()
+                .numpy(),
+            }
+        )
+        return output
+
     def _run_action_loss_with_fixed_rng(
         self,
         *,
@@ -393,6 +636,9 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
         cross_attn_query_intent_probabilities = (
             intent_probabilities if self.use_cross_attn_query_film else None
         )
+        intent_film_confidence = self._intent_film_confidence(
+            intent_probabilities
+        )
         cuda_devices = []
         if actions_target.device.type == "cuda":
             cuda_devices = [
@@ -412,6 +658,7 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
                 intent_condition=intent_condition,
                 ffn_intent_probabilities=ffn_intent_probabilities,
                 cross_attn_query_intent_probabilities=cross_attn_query_intent_probabilities,
+                intent_film_confidence=intent_film_confidence,
             )
 
     @torch.inference_mode()
@@ -541,6 +788,7 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
         intent_probabilities = None
         intent_condition = None
         intent_diagnostics = {}
+        intent_film_confidence = None
         if need_intent:
             attention_diagnostics_interval = int(
                 self.config.framework.intent.get("attention_diagnostics_interval", 100)
@@ -574,9 +822,39 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
                 )
             if self.add_intent_to_timestep_embedding:
                 intent_condition = self.intent_to_timestep(intent_probabilities)
+            intent_film_confidence = self._intent_film_confidence(
+                intent_probabilities
+            )
 
         if current_stage == "s0":
             targets = self._intent_targets(examples, base_hidden.device)
+            if self.use_factorized_intent:
+                intent_loss, weighted_loss, factorized_metrics = (
+                    self._factorized_intent_loss(
+                        intent_logits, targets, loss_weight=1.0
+                    )
+                )
+                zero_action_loss = sum(
+                    value.sum() for value in intent_logits.values()
+                ) * 0.0
+                output = {
+                    "action_loss": zero_action_loss,
+                    "total_loss": intent_loss,
+                    "intent_loss": intent_loss,
+                    "weighted_intent_loss": weighted_loss,
+                    "intent_training_stage_id": torch.zeros(
+                        (), device=base_hidden.device, dtype=torch.float32
+                    ),
+                    "intent_xyz_logits": intent_logits["xyz"],
+                    "intent_rpy_logits": intent_logits["rpy"],
+                    "intent_gripper_logits": intent_logits["gripper"],
+                    "intent_xyz_targets": targets["xyz"],
+                    "intent_rpy_targets": targets["rpy"],
+                    "intent_gripper_targets": targets["gripper"],
+                    **factorized_metrics,
+                    **intent_diagnostics,
+                }
+                return output
             intent_loss_output = compute_intent_auxiliary_loss(
                 intent_logits, targets, loss_weight=1.0
             )
@@ -632,6 +910,27 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
                 if self.use_cross_attn_query_film
                 else None
             )
+            repeated_intent_film_confidence = (
+                intent_film_confidence.repeat(repeat_count)
+                if intent_film_confidence is not None
+                else None
+            )
+            intent_film_sample_mask = None
+            if (
+                self.training
+                and self.use_cross_attn_query_film
+                and self.intent_condition_dropout > 0
+            ):
+                intent_film_sample_mask = (
+                    torch.rand(
+                        intent_probabilities.shape[0],
+                        device=intent_probabilities.device,
+                    )
+                    >= self.intent_condition_dropout
+                ).to(dtype=intent_probabilities.dtype)
+                intent_film_sample_mask = intent_film_sample_mask.repeat(
+                    repeat_count
+                )
 
             action_output = self.action_model(
                 vl_embs_list_repeated,
@@ -643,6 +942,8 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
                 cross_attn_query_intent_probabilities=(
                     repeated_cross_attn_query_intent_probabilities
                 ),
+                intent_film_confidence=repeated_intent_film_confidence,
+                intent_film_sample_mask=intent_film_sample_mask,
                 return_condition_diagnostics=bool(
                     repeated_intent_condition is not None
                     or repeated_ffn_intent_probabilities is not None
@@ -670,7 +971,12 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
             stage_id, device=base_hidden.device, dtype=torch.float32
         )
         if intent_probabilities is not None:
-            output.update(self._intent_probability_metrics(intent_probabilities))
+            if not self.use_factorized_intent:
+                output.update(self._intent_probability_metrics(intent_probabilities))
+        if intent_film_confidence is not None:
+            output["intent_film_confidence_mean"] = (
+                intent_film_confidence.float().mean().detach()
+            )
         if intent_condition is not None:
             output.update(
                 {
@@ -681,6 +987,28 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
             )
         if self.use_intent_aux_loss and intent_logits is not None:
             targets = self._intent_targets(examples, base_hidden.device)
+            if self.use_factorized_intent:
+                intent_loss, raw_weighted_loss, factorized_metrics = (
+                    self._factorized_intent_loss(
+                        intent_logits,
+                        targets,
+                        loss_weight=self.intent_loss_weight,
+                    )
+                )
+                weighted_loss = (
+                    torch.zeros_like(raw_weighted_loss)
+                    if current_stage == "s1"
+                    else raw_weighted_loss
+                )
+                output.update(
+                    {
+                        "intent_loss": intent_loss,
+                        "weighted_intent_loss": weighted_loss,
+                        "total_loss": action_loss + weighted_loss,
+                        **factorized_metrics,
+                    }
+                )
+                return output
             intent_loss_output = compute_intent_auxiliary_loss(
                 intent_logits,
                 targets,
@@ -740,6 +1068,8 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
         _, probabilities, _ = self._predict_intent(
             intent_hidden_states, attention_mask
         )
+        if self.use_factorized_intent:
+            return self._format_factorized_intent_predictions(probabilities)
         return self._format_intent_predictions(probabilities)
 
     @torch.inference_mode()
@@ -768,9 +1098,21 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
 
         intent_condition = None
         intent_probabilities = None
+        intent_film_confidence = None
         disable_intent_conditioning = bool(
             kwargs.get("disable_intent_conditioning", False)
         )
+        intent_film_scale = float(kwargs.get("intent_film_scale", 1.0))
+        if self.use_factorized_intent and intent_film_scale != 1.0:
+            raise ValueError(
+                "factorized Intent uses fixed bounded modulation and does not "
+                "support a global intent_film_scale"
+            )
+        if not 0.0 <= intent_film_scale <= 1.0:
+            raise ValueError(
+                "intent_film_scale must be within [0, 1], "
+                f"got {intent_film_scale}"
+            )
         if (
             self.add_intent_to_timestep_embedding
             or self.use_ffn_intent_film
@@ -781,6 +1123,9 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
             )
             _, intent_probabilities, _ = self._predict_intent(
                 intent_hidden_states, backbone_attention_mask
+            )
+            intent_film_confidence = self._intent_film_confidence(
+                intent_probabilities
             )
         if self.add_intent_to_timestep_embedding and not disable_intent_conditioning:
             intent_condition = self.intent_to_timestep(intent_probabilities)
@@ -819,17 +1164,34 @@ class Qwen_PI_Intent_v3(Qwen_PI_v3):
                         if self.use_cross_attn_query_film and not disable_intent_conditioning
                         else None
                     ),
+                    intent_film_confidence=(
+                        intent_film_confidence
+                        if not disable_intent_conditioning
+                        else None
+                    ),
+                    intent_film_scale=intent_film_scale,
                 )
 
         output = {"normalized_actions": pred_actions.detach().cpu().numpy()}
         if intent_probabilities is not None:
-            intent_predictions = self._format_intent_predictions(
-                intent_probabilities
+            intent_predictions = (
+                self._format_factorized_intent_predictions(intent_probabilities)
+                if self.use_factorized_intent
+                else self._format_intent_predictions(intent_probabilities)
             )
             intent_predictions["conditioning_applied"] = np.full(
                 intent_probabilities.shape[0],
-                not disable_intent_conditioning,
+                not disable_intent_conditioning and intent_film_scale > 0.0,
                 dtype=np.bool_,
             )
+            intent_predictions["intent_film_scale"] = np.full(
+                intent_probabilities.shape[0],
+                intent_film_scale,
+                dtype=np.float32,
+            )
+            if intent_film_confidence is not None:
+                intent_predictions["intent_film_confidence"] = (
+                    intent_film_confidence.detach().cpu().numpy()
+                )
             output["intent_predictions"] = intent_predictions
         return output

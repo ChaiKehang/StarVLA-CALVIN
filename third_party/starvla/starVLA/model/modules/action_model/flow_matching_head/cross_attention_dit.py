@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import logging
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -66,6 +66,82 @@ class AdaLayerNorm(nn.Module):
         scale, shift = temb.chunk(2, dim=1)
         x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
         return x
+
+
+class IntentFiLMMLP(nn.Module):
+    """Nonlinear Intent-to-FiLM projector with an identity-safe output.
+
+    The final projection is zero initialized, so enabling this module leaves
+    the pretrained Action DiT path unchanged until its weights are updated.
+    """
+
+    def __init__(
+        self,
+        num_intent_classes: int,
+        hidden_dim: int,
+        output_dim: int,
+        output_bias: bool = False,
+    ) -> None:
+        super().__init__()
+        if num_intent_classes <= 1:
+            raise ValueError("num_intent_classes must be greater than one")
+        if hidden_dim <= 0:
+            raise ValueError("Intent FiLM hidden_dim must be positive")
+        if output_dim <= 0:
+            raise ValueError("Intent FiLM output_dim must be positive")
+
+        self.in_features = int(num_intent_classes)
+        self.hidden_features = int(hidden_dim)
+        self.out_features = int(output_dim)
+        self.input_proj = nn.Linear(self.in_features, self.hidden_features)
+        self.activation = nn.SiLU()
+        self.norm = nn.LayerNorm(self.hidden_features)
+        self.output_proj = nn.Linear(
+            self.hidden_features,
+            self.out_features,
+            bias=output_bias,
+        )
+        nn.init.zeros_(self.output_proj.weight)
+        if self.output_proj.bias is not None:
+            nn.init.zeros_(self.output_proj.bias)
+
+    def forward(self, probabilities: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.input_proj(probabilities)
+        hidden_states = self.activation(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        return self.output_proj(hidden_states)
+
+
+def build_intent_film_projector(
+    *,
+    num_intent_classes: int,
+    output_dim: int,
+    projector_type: str,
+    hidden_dim: int,
+    output_bias: bool = False,
+) -> nn.Module:
+    """Build either the checkpoint-compatible Linear or the nonlinear MLP."""
+
+    projector_type = str(projector_type).lower()
+    if projector_type == "linear":
+        projection = nn.Linear(
+            num_intent_classes, output_dim, bias=output_bias
+        )
+        nn.init.zeros_(projection.weight)
+        if projection.bias is not None:
+            nn.init.zeros_(projection.bias)
+        return projection
+    if projector_type == "mlp":
+        return IntentFiLMMLP(
+            num_intent_classes=num_intent_classes,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            output_bias=output_bias,
+        )
+    raise ValueError(
+        "Intent FiLM projector_type must be 'linear' or 'mlp', "
+        f"got {projector_type!r}"
+    )
 
 
 class BasicTransformerBlock(nn.Module):
@@ -141,15 +217,22 @@ class BasicTransformerBlock(nn.Module):
             inner_dim=ff_inner_dim,
             bias=ff_bias,
         )
-        self.ffn_intent_film: Optional[nn.Linear] = None
-        self.cross_attn_query_intent_film: Optional[nn.Linear] = None
+        self.ffn_intent_film: Optional[nn.Module] = None
+        self.cross_attn_query_intent_film: Optional[nn.Module] = None
+        self.cross_attn_query_intent_film_bound: Optional[float] = None
         self._last_intent_film_diagnostics = {}
         if final_dropout:
             self.final_dropout = nn.Dropout(dropout)
         else:
             self.final_dropout = None
 
-    def enable_ffn_intent_film(self, num_intent_classes: int) -> None:
+    def enable_ffn_intent_film(
+        self,
+        num_intent_classes: int,
+        *,
+        projector_type: str = "linear",
+        hidden_dim: int = 256,
+    ) -> None:
         """Attach the E1-C per-block FiLM projection without replacing FFN weights."""
 
         if num_intent_classes <= 1:
@@ -162,10 +245,22 @@ class BasicTransformerBlock(nn.Module):
                 )
             return
 
-        self.ffn_intent_film = nn.Linear(num_intent_classes, 2 * self.dim, bias=False)
-        nn.init.zeros_(self.ffn_intent_film.weight)
+        self.ffn_intent_film = build_intent_film_projector(
+            num_intent_classes=num_intent_classes,
+            output_dim=2 * self.dim,
+            projector_type=projector_type,
+            hidden_dim=hidden_dim,
+        )
 
-    def enable_cross_attn_query_intent_film(self, num_intent_classes: int) -> None:
+    def enable_cross_attn_query_intent_film(
+        self,
+        num_intent_classes: int,
+        *,
+        projector_type: str = "linear",
+        hidden_dim: int = 256,
+        output_bias: bool = False,
+        modulation_bound: Optional[float] = None,
+    ) -> None:
         """Attach zero-initialized Intent Query-FiLM to a cross-attention block."""
 
         if self.cross_attention_dim is None:
@@ -179,10 +274,18 @@ class BasicTransformerBlock(nn.Module):
                     f"{self.cross_attn_query_intent_film.in_features} classes"
                 )
             return
-        self.cross_attn_query_intent_film = nn.Linear(
-            num_intent_classes, 2 * self.dim, bias=False
+        self.cross_attn_query_intent_film = build_intent_film_projector(
+            num_intent_classes=num_intent_classes,
+            output_dim=2 * self.dim,
+            projector_type=projector_type,
+            hidden_dim=hidden_dim,
+            output_bias=output_bias,
         )
-        nn.init.zeros_(self.cross_attn_query_intent_film.weight)
+        if modulation_bound is not None and float(modulation_bound) <= 0:
+            raise ValueError("modulation_bound must be positive")
+        self.cross_attn_query_intent_film_bound = (
+            float(modulation_bound) if modulation_bound is not None else None
+        )
 
     def forward(
         self,
@@ -193,9 +296,27 @@ class BasicTransformerBlock(nn.Module):
         temb: Optional[torch.LongTensor] = None,
         ffn_intent_probabilities: Optional[torch.Tensor] = None,
         cross_attn_query_intent_probabilities: Optional[torch.Tensor] = None,
+        intent_film_confidence: Optional[torch.Tensor] = None,
+        intent_film_sample_mask: Optional[torch.Tensor] = None,
+        intent_film_scale: float = 1.0,
     ) -> torch.Tensor:
 
         self._last_intent_film_diagnostics = {}
+        confidence = 1.0
+        if intent_film_confidence is not None:
+            confidence = intent_film_confidence.to(
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            if confidence.ndim == 1:
+                confidence = confidence[:, None, None]
+            elif confidence.ndim == 2 and confidence.shape[1] == 1:
+                confidence = confidence[:, :, None]
+            else:
+                raise ValueError(
+                    "intent_film_confidence must have shape [B] or [B,1], "
+                    f"got {tuple(confidence.shape)}"
+                )
 
         # 0. Self-Attention
         if self.norm_type == "ada_norm":
@@ -213,20 +334,49 @@ class BasicTransformerBlock(nn.Module):
                 )
             film_parameters = self.cross_attn_query_intent_film(
                 cross_attn_query_intent_probabilities.to(
-                    device=self.cross_attn_query_intent_film.weight.device,
-                    dtype=self.cross_attn_query_intent_film.weight.dtype,
+                    device=next(self.cross_attn_query_intent_film.parameters()).device,
+                    dtype=next(self.cross_attn_query_intent_film.parameters()).dtype,
                 )
             )
             delta_gamma, delta_beta = film_parameters.chunk(2, dim=-1)
+            raw_delta_gamma = delta_gamma
+            raw_delta_beta = delta_beta
+            if self.cross_attn_query_intent_film_bound is not None:
+                bound = self.cross_attn_query_intent_film_bound
+                delta_gamma = bound * torch.tanh(delta_gamma)
+                delta_beta = bound * torch.tanh(delta_beta)
             delta_gamma = delta_gamma[:, None].to(dtype=norm_hidden_states.dtype)
             delta_beta = delta_beta[:, None].to(dtype=norm_hidden_states.dtype)
+            sample_mask = 1.0
+            if intent_film_sample_mask is not None:
+                sample_mask = intent_film_sample_mask.to(
+                    device=norm_hidden_states.device,
+                    dtype=norm_hidden_states.dtype,
+                )
+                if sample_mask.ndim == 1:
+                    sample_mask = sample_mask[:, None, None]
+                elif sample_mask.ndim == 2 and sample_mask.shape[1] == 1:
+                    sample_mask = sample_mask[:, :, None]
+                else:
+                    raise ValueError(
+                        "intent_film_sample_mask must have shape [B] or [B,1]"
+                    )
             original_query = norm_hidden_states
-            norm_hidden_states = (1 + delta_gamma) * original_query + delta_beta
+            scale = float(intent_film_scale)
+            norm_hidden_states = original_query + scale * (
+                sample_mask
+                * confidence
+                * (delta_gamma * original_query + delta_beta)
+            )
             eps = torch.finfo(torch.float32).eps
             self._last_intent_film_diagnostics.update(
                 {
                     "query_film_delta_gamma_rms": delta_gamma.float().square().mean().sqrt().detach(),
                     "query_film_delta_beta_rms": delta_beta.float().square().mean().sqrt().detach(),
+                    "query_film_raw_delta_gamma_abs_max": raw_delta_gamma.float().abs().max().detach(),
+                    "query_film_raw_delta_beta_abs_max": raw_delta_beta.float().abs().max().detach(),
+                    "query_film_bounded_delta_gamma_abs_max": delta_gamma.float().abs().max().detach(),
+                    "query_film_bounded_delta_beta_abs_max": delta_beta.float().abs().max().detach(),
                     "query_film_modulation_to_query_l2_ratio": (
                         (norm_hidden_states - original_query).float().norm(dim=-1)
                         / original_query.float().norm(dim=-1).clamp_min(eps)
@@ -255,16 +405,20 @@ class BasicTransformerBlock(nn.Module):
                 )
             film_parameters = self.ffn_intent_film(
                 ffn_intent_probabilities.to(
-                    device=self.ffn_intent_film.weight.device,
-                    dtype=self.ffn_intent_film.weight.dtype,
+                    device=next(self.ffn_intent_film.parameters()).device,
+                    dtype=next(self.ffn_intent_film.parameters()).dtype,
                 )
             )
             delta_gamma, delta_beta = film_parameters.chunk(2, dim=-1)
             original_ffn_input = norm_hidden_states
-            norm_hidden_states = (
-                (1 + delta_gamma[:, None].to(dtype=norm_hidden_states.dtype))
-                * original_ffn_input
-                + delta_beta[:, None].to(dtype=norm_hidden_states.dtype)
+            scale = float(intent_film_scale)
+            norm_hidden_states = original_ffn_input + scale * (
+                confidence
+                * (
+                    delta_gamma[:, None].to(dtype=norm_hidden_states.dtype)
+                    * original_ffn_input
+                    + delta_beta[:, None].to(dtype=norm_hidden_states.dtype)
+                )
             )
             eps = torch.finfo(torch.float32).eps
             self._last_intent_film_diagnostics.update(
@@ -368,18 +522,82 @@ class DiT(ModelMixin, ConfigMixin):
             sum(p.numel() for p in self.parameters() if p.requires_grad),
         )
 
-    def enable_ffn_intent_film(self, num_intent_classes: int) -> None:
+    def enable_ffn_intent_film(
+        self,
+        num_intent_classes: int,
+        *,
+        projector_type: str = "linear",
+        hidden_dim: int = 256,
+    ) -> None:
         """Enable an independent zero-initialized E1-C FiLM in every block."""
 
         for block in self.transformer_blocks:
-            block.enable_ffn_intent_film(num_intent_classes)
+            block.enable_ffn_intent_film(
+                num_intent_classes,
+                projector_type=projector_type,
+                hidden_dim=hidden_dim,
+            )
 
-    def enable_cross_attn_query_intent_film(self, num_intent_classes: int) -> None:
-        """Enable Query-FiLM only in blocks that consume VLM cross-attention K/V."""
+    def enable_cross_attn_query_intent_film(
+        self,
+        num_intent_classes: int,
+        *,
+        projector_type: str = "linear",
+        hidden_dim: int = 256,
+        layer_numbers: Optional[Sequence[int]] = None,
+        output_bias: bool = False,
+        modulation_bound: Optional[float] = None,
+    ) -> None:
+        """Enable Query-FiLM in selected 1-based cross-attention blocks."""
 
-        for block in self.transformer_blocks:
+        selected = None
+        if layer_numbers is not None:
+            selected_list = [int(layer) for layer in layer_numbers]
+            if len(selected_list) != len(set(selected_list)):
+                raise ValueError(
+                    f"Query-FiLM layer_numbers must be unique, got {selected_list}"
+                )
+            invalid = [
+                layer
+                for layer in selected_list
+                if layer < 1 or layer > len(self.transformer_blocks)
+            ]
+            if invalid:
+                raise ValueError(
+                    "Query-FiLM layer number is outside the DiT depth: "
+                    f"invalid={invalid}, depth={len(self.transformer_blocks)}"
+                )
+            selected = set(selected_list)
+
+        enabled_layers = []
+        for layer_number, block in enumerate(self.transformer_blocks, start=1):
+            if selected is not None and layer_number not in selected:
+                continue
             if block.cross_attention_dim is not None:
-                block.enable_cross_attn_query_intent_film(num_intent_classes)
+                block.enable_cross_attn_query_intent_film(
+                    num_intent_classes,
+                    projector_type=projector_type,
+                    hidden_dim=hidden_dim,
+                    output_bias=output_bias,
+                    modulation_bound=modulation_bound,
+                )
+                enabled_layers.append(layer_number)
+            elif selected is not None:
+                raise ValueError(
+                    "Query-FiLM can only target cross-attention blocks; "
+                    f"1-based layer {layer_number} is a self-attention block"
+                )
+
+        if selected is not None and set(enabled_layers) != selected:
+            raise RuntimeError(
+                "Failed to enable every selected Query-FiLM layer: "
+                f"requested={sorted(selected)}, enabled={enabled_layers}"
+            )
+        self.query_intent_film_layer_numbers = tuple(enabled_layers)
+        logging.getLogger(__name__).info(
+            "Enabled Query-FiLM in 1-based DiT layers: %s",
+            enabled_layers,
+        )
 
     def forward(
         self,
@@ -392,8 +610,17 @@ class DiT(ModelMixin, ConfigMixin):
         intent_condition: Optional[torch.Tensor] = None,
         ffn_intent_probabilities: Optional[torch.Tensor] = None,
         cross_attn_query_intent_probabilities: Optional[torch.Tensor] = None,
+        intent_film_confidence: Optional[torch.Tensor] = None,
+        intent_film_sample_mask: Optional[torch.Tensor] = None,
+        intent_film_scale: float = 1.0,
         return_condition_diagnostics: bool = False,
     ):
+        intent_film_scale = float(intent_film_scale)
+        if not 0.0 <= intent_film_scale <= 1.0:
+            raise ValueError(
+                "intent_film_scale must be within [0, 1], "
+                f"got {intent_film_scale}"
+            )
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
         condition_diagnostics = {}
@@ -450,6 +677,25 @@ class DiT(ModelMixin, ConfigMixin):
                     "Query-FiLM intent batch must match hidden_states batch: "
                     f"got {cross_attn_query_intent_probabilities.shape[0]} and {hidden_states.shape[0]}"
                 )
+        if intent_film_confidence is not None:
+            if intent_film_confidence.ndim not in {1, 2}:
+                raise ValueError(
+                    "intent_film_confidence must have shape [B] or [B,1], "
+                    f"got {tuple(intent_film_confidence.shape)}"
+                )
+            if (
+                intent_film_confidence.ndim == 2
+                and intent_film_confidence.shape[1] != 1
+            ):
+                raise ValueError(
+                    "intent_film_confidence must have shape [B] or [B,1], "
+                    f"got {tuple(intent_film_confidence.shape)}"
+                )
+            if intent_film_confidence.shape[0] != hidden_states.shape[0]:
+                raise ValueError(
+                    "Intent confidence batch must match hidden_states batch: "
+                    f"got {intent_film_confidence.shape[0]} and {hidden_states.shape[0]}"
+                )
 
         # Process through transformer blocks - single pass through the blocks
         hidden_states = hidden_states.contiguous()
@@ -474,6 +720,9 @@ class DiT(ModelMixin, ConfigMixin):
                     temb=temb,
                     ffn_intent_probabilities=ffn_intent_probabilities,
                     cross_attn_query_intent_probabilities=cross_attn_query_intent_probabilities,
+                    intent_film_confidence=intent_film_confidence,
+                    intent_film_sample_mask=intent_film_sample_mask,
+                    intent_film_scale=intent_film_scale,
                 )
             else:
                 if is_layerwise_encoder:
@@ -488,6 +737,9 @@ class DiT(ModelMixin, ConfigMixin):
                     temb=temb,
                     ffn_intent_probabilities=ffn_intent_probabilities,
                     cross_attn_query_intent_probabilities=cross_attn_query_intent_probabilities,
+                    intent_film_confidence=intent_film_confidence,
+                    intent_film_sample_mask=intent_film_sample_mask,
+                    intent_film_scale=intent_film_scale,
                 )
             if return_condition_diagnostics:
                 for name, value in block._last_intent_film_diagnostics.items():
