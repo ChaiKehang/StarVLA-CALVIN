@@ -27,6 +27,7 @@ from pathlib import Path
 import hydra
 import numpy as np
 import tyro
+from PIL import Image
 
 # # Add Calvin to path
 # CALVIN_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "calvin"
@@ -77,6 +78,7 @@ class Args:
     calvin_config_path: str = "/path/to/calvin/calvin_models/conf"
     eval_sequences_path: str = "/path/to/calvin/eval_sequences.json"
     num_sequences: int = 1000  # Number of evaluation sequences
+    sequence_start_index: int = 0  # Preserve the original CALVIN sequence index when slicing
     num_workers: int = 1  # For future multi-process support
     seed: int = 0
     create_plan_tsne: bool = False
@@ -343,6 +345,7 @@ def evaluate_policy_ddp(
     calvin_conf_path,
     eval_sequences_path,
     num_sequences,
+    sequence_start_index=0,
     eval_log_dir=None,
     debug=False,
     create_plan_tsne=False,
@@ -377,8 +380,16 @@ def evaluate_policy_ddp(
     eval_log_dir = get_log_dir(eval_log_dir)
     with open(eval_sequences_path, "r") as f:
         eval_sequences = json.load(f)
+    sequence_start_index = int(sequence_start_index)
+    if sequence_start_index < 0 or sequence_start_index >= len(eval_sequences):
+        raise ValueError(
+            "sequence_start_index must select an existing CALVIN sequence: "
+            f"got {sequence_start_index}, total={len(eval_sequences)}"
+        )
+    sequence_stop_index = None
     if num_sequences is not None and num_sequences > 0:
-        eval_sequences = eval_sequences[:num_sequences]
+        sequence_stop_index = sequence_start_index + int(num_sequences)
+    eval_sequences = eval_sequences[sequence_start_index:sequence_stop_index]
     # device_num = int(torch.distributed.get_world_size())
     # device_id = torch.distributed.get_rank()
     # assert num_sequences % device_num == 0
@@ -387,7 +398,7 @@ def evaluate_policy_ddp(
     results = []
     plans = defaultdict(list)
     local_sequence_i = 0
-    base_sequence_i = 0  # device_id * interval_len
+    base_sequence_i = sequence_start_index
 
     if not debug:
         eval_sequences = tqdm(eval_sequences, position=0, leave=True)
@@ -537,6 +548,41 @@ def rollout(
         policy.begin_subtask(sequence_i, subtask_i, subtask)
     start_info = env.get_info()
 
+    # Optional report-asset capture. This is deliberately performed before the
+    # first policy call so the static and wrist images are the exact same
+    # observation paired with this subtask's language instruction. The default
+    # is disabled and therefore leaves ordinary CALVIN evaluation unchanged.
+    if os.environ.get("CALVIN_CAPTURE_DUAL_CAMERA_INPUTS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        capture_dir = Path(eval_log_dir) / "dual_camera_inputs"
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{sequence_i:03d}-{subtask_i}-{subtask}"
+        Image.fromarray(obs["rgb_obs"]["rgb_static"]).save(
+            capture_dir / f"{stem}_static.png"
+        )
+        Image.fromarray(obs["rgb_obs"]["rgb_gripper"]).save(
+            capture_dir / f"{stem}_gripper.png"
+        )
+        metadata_path = capture_dir / "metadata.jsonl"
+        with metadata_path.open("a", encoding="utf-8") as metadata_file:
+            metadata_file.write(
+                json.dumps(
+                    {
+                        "sequence_index": int(sequence_i),
+                        "subtask_index": int(subtask_i),
+                        "subtask": subtask,
+                        "language_instruction": lang_annotation,
+                        "static_rgb": f"{stem}_static.png",
+                        "gripper_rgb": f"{stem}_gripper.png",
+                    }
+                )
+                + "\n"
+            )
+
     if debug:
         img_queue = []
 
@@ -598,6 +644,7 @@ def main(args: Args):
         args.calvin_config_path,
         args.eval_sequences_path,
         args.num_sequences,
+        args.sequence_start_index,
         args.eval_log_dir,
         args.debug,
         args.create_plan_tsne,

@@ -15,6 +15,7 @@ dataset_path="${dataset_path:-/home/liuchang/kehang/488project/scripts/reference
 calvin_config_path="${calvin_config_path:-/home/liuchang/kehang/488project/code/calvin/calvin_models/conf}"
 eval_sequences_path="${eval_sequences_path:-/home/liuchang/kehang/488project/code/starvla/examples/calvin/eval_files/eval_sequences.json}"
 num_sequences="${num_sequences:-1}"
+sequence_start_index="${sequence_start_index:-0}"
 replan_steps="${replan_steps:-5}"
 inference_seed="${inference_seed:-42}"
 debug="${debug:-true}"
@@ -72,6 +73,7 @@ cd "${STARVLA_DIR}"
     --args.calvin_config_path "${calvin_config_path}" \
     --args.eval_sequences_path "${eval_sequences_path}" \
     --args.num_sequences "${num_sequences}" \
+    --args.sequence-start-index "${sequence_start_index}" \
     --args.replan_steps "${replan_steps}" \
     --args.inference-seed "${inference_seed}" \
     "${DEBUG_ARGS[@]}" \

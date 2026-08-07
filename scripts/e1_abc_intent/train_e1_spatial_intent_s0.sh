@@ -114,8 +114,11 @@ fi
 TARGET_RUN_DIR="${CHECKPOINT_ROOT}/${RUN_ID}"
 if [[ -d "${TARGET_RUN_DIR}" ]] && [[ -n "$(find "${TARGET_RUN_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
   if [[ "${TRAINER_IS_RESUME}" == "true" ]]; then
-    if ! find "${TARGET_RUN_DIR}/checkpoints" -maxdepth 1 -type f \
-      -name 'steps_*_pytorch_model.pt' -print -quit 2>/dev/null | rg -q .; then
+    RESUME_MODEL_CHECKPOINT="$(
+      find "${TARGET_RUN_DIR}/checkpoints" -maxdepth 1 -type f \
+        -name 'steps_*_pytorch_model.pt' -print -quit 2>/dev/null
+    )"
+    if [[ -z "${RESUME_MODEL_CHECKPOINT}" ]]; then
       echo "[ERROR] Resume requested but no step checkpoint exists in ${TARGET_RUN_DIR}/checkpoints." >&2
       exit 3
     fi
