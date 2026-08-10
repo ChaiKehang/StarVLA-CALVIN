@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Start the 90k policy server and run CALVIN evaluation in one allocation.
-# The caller controls CUDA visibility; this script never selects a physical GPU.
+# Canonical 500-sequence CALVIN-D evaluation for aligned-9 checkpoints.
 
 set -euo pipefail
 
@@ -8,57 +7,56 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 STARVLA_DIR="${STARVLA_DIR:-${PROJECT_ROOT}/third_party/starvla}"
 CALVIN_DIR="${CALVIN_DIR:-${PROJECT_ROOT}/third_party/calvin}"
-EVO_DIR="${EVO_DIR:-${PROJECT_ROOT}/scripts/reference/Evo-1_sixpigs}"
+MODEL_ROOT="${MODEL_ROOT:-/home/data/models/kehang-StarVLA}"
+RUN_DIR="${RUN_DIR:-${MODEL_ROOT}/checkpoints/calvin/e1_factorized_aligned9_query_s1_10k_s2_80k}"
 
-: "${CKPT90K:?Set CKPT90K to steps_90000_pytorch_model.pt}"
+CHECKPOINT_STEP="${CHECKPOINT_STEP:-90000}"
+case "${CHECKPOINT_STEP}" in
+  60000|90000) ;;
+  *) echo "[ERROR] CHECKPOINT_STEP must be 60000 or 90000." >&2; exit 2 ;;
+esac
+CHECKPOINT="${CHECKPOINT:-${RUN_DIR}/checkpoints/steps_${CHECKPOINT_STEP}_pytorch_model.pt}"
 
-STARVLA_PYTHON="${STARVLA_PYTHON:-python}"
-CALVIN_PYTHON="${CALVIN_PYTHON:-python}"
+STARVLA_PYTHON="${STARVLA_PYTHON:-/home/liuchang/miniconda3/envs/starvla-e0/bin/python}"
+CALVIN_PYTHON="${CALVIN_PYTHON:-/home/liuchang/miniconda3/envs/calvin-eval/bin/python}"
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-5694}"
-UNNORM_KEY="${UNNORM_KEY:-franka}"
-NUM_SEQUENCES="${NUM_SEQUENCES:-10}"
+PORT="${PORT:-5701}"
+NUM_SEQUENCES="${NUM_SEQUENCES:-500}"
 REPLAN_STEPS="${REPLAN_STEPS:-5}"
+INFERENCE_SEED="${INFERENCE_SEED:-42}"
 DEBUG="${DEBUG:-true}"
-EVAL_DATASET="${EVAL_DATASET:-${EVO_DIR}/CALVIN_evaluation/ABC_D_validation}"
+UNNORM_KEY="${UNNORM_KEY:-franka}"
+EVAL_DATASET="${EVAL_DATASET:-${PROJECT_ROOT}/scripts/reference/Evo-1_sixpigs/CALVIN_evaluation/ABC_D_validation}"
 CALVIN_CONFIG_PATH="${CALVIN_CONFIG_PATH:-${CALVIN_DIR}/calvin_models/conf}"
 EVAL_SEQUENCES="${EVAL_SEQUENCES:-${STARVLA_DIR}/examples/calvin/eval_files/eval_sequences.json}"
-EVAL_LOG_DIR="${EVAL_LOG_DIR:-${PROJECT_ROOT}/eval_logs/e0_abc_rel/repro_${NUM_SEQUENCES}_$(date +%Y%m%d_%H%M%S)}"
+EVAL_LOG_DIR="${EVAL_LOG_DIR:-${PROJECT_ROOT}/eval_logs/e1_factorized_intent/aligned9_steps${CHECKPOINT_STEP}_calvin${NUM_SEQUENCES}_intent_on_$(date +%Y%m%d_%H%M%S)}"
 
-for required in "${STARVLA_DIR}" "${CALVIN_DIR}" "${CKPT90K}" \
+for required in "${STARVLA_DIR}" "${CALVIN_DIR}" "${CHECKPOINT}" \
+  "${RUN_DIR}/config.yaml" "${RUN_DIR}/dataset_statistics.json" \
   "${EVAL_DATASET}/validation/.hydra/merged_config.yaml" \
-  "${CALVIN_CONFIG_PATH}" "${EVAL_SEQUENCES}"; do
+  "${CALVIN_CONFIG_PATH}" "${EVAL_SEQUENCES}" \
+  "${STARVLA_PYTHON}" "${CALVIN_PYTHON}"; do
   if [[ ! -e "${required}" ]]; then
     echo "[ERROR] Required evaluation path does not exist: ${required}" >&2
     exit 2
   fi
 done
-
-RUN_DIR="$(dirname "$(dirname "${CKPT90K}")")"
-for sidecar in "${RUN_DIR}/config.yaml" "${RUN_DIR}/dataset_statistics.json"; do
-  if [[ ! -f "${sidecar}" ]]; then
-    echo "[ERROR] Checkpoint sidecar is missing: ${sidecar}" >&2
-    exit 3
-  fi
-done
+if [[ -d "${EVAL_LOG_DIR}" ]] && [[ -n "$(find "${EVAL_LOG_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+  echo "[ERROR] Evaluation output is not empty: ${EVAL_LOG_DIR}" >&2
+  exit 3
+fi
 
 case "${DEBUG}" in
   true|True|TRUE|1|yes|YES|on|ON) DEBUG_ARG=--args.debug ;;
   false|False|FALSE|0|no|NO|off|OFF) DEBUG_ARG=--args.no-debug ;;
-  *) echo "[ERROR] DEBUG must be true or false." >&2; exit 4 ;;
+  *) echo "[ERROR] DEBUG must be true or false." >&2; exit 2 ;;
 esac
 
-if [[ -d "${EVAL_LOG_DIR}" ]] && [[ -n "$(find "${EVAL_LOG_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
-  echo "[ERROR] Evaluation directory is not empty: ${EVAL_LOG_DIR}" >&2
-  echo "Choose a new EVAL_LOG_DIR so existing results/videos are not overwritten." >&2
-  exit 5
-fi
 mkdir -p "${EVAL_LOG_DIR}"
 export PYTHONPATH="${STARVLA_DIR}:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
-
 POLICY_LOG="${EVAL_LOG_DIR}/policy_server.log"
-EVAL_STDOUT="${EVAL_LOG_DIR}/eval_stdout.log"
+EVAL_LOG="${EVAL_LOG_DIR}/eval_client.log"
 
 cleanup() {
   if [[ -n "${POLICY_PID:-}" ]] && kill -0 "${POLICY_PID}" 2>/dev/null; then
@@ -70,13 +68,11 @@ trap cleanup EXIT INT TERM
 
 cd "${STARVLA_DIR}"
 "${STARVLA_PYTHON}" deployment/model_server/server_policy.py \
-  --ckpt_path "${CKPT90K}" \
+  --ckpt_path "${CHECKPOINT}" \
   --port "${PORT}" \
   --use_bf16 >"${POLICY_LOG}" 2>&1 &
 POLICY_PID=$!
 
-echo "Policy server PID=${POLICY_PID}; log=${POLICY_LOG}"
-echo "Waiting for ${HOST}:${PORT} ..."
 "${CALVIN_PYTHON}" - "${HOST}" "${PORT}" "${POLICY_PID}" <<'PY'
 import os
 import socket
@@ -101,7 +97,7 @@ PY
 
 set -o pipefail
 "${CALVIN_PYTHON}" examples/calvin/eval_files/eval_calvin.py \
-  --args.pretrained-path "${CKPT90K}" \
+  --args.pretrained-path "${CHECKPOINT}" \
   --args.unnorm-key "${UNNORM_KEY}" \
   --args.host "${HOST}" \
   --args.port "${PORT}" \
@@ -110,5 +106,6 @@ set -o pipefail
   --args.eval_sequences_path "${EVAL_SEQUENCES}" \
   --args.num_sequences "${NUM_SEQUENCES}" \
   --args.replan_steps "${REPLAN_STEPS}" \
+  --args.inference-seed "${INFERENCE_SEED}" \
   "${DEBUG_ARG}" \
-  --args.eval_log_dir "${EVAL_LOG_DIR}" 2>&1 | tee "${EVAL_STDOUT}"
+  --args.eval_log_dir "${EVAL_LOG_DIR}" 2>&1 | tee "${EVAL_LOG}"

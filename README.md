@@ -1,15 +1,16 @@
-# StarVLA + CALVIN ABC→D E0 Baseline
+# StarVLA + CALVIN ABC→D：E0 Baseline 与 Factorized Spatial Intent
 
-本仓库记录并复现一个已跑通的 StarVLA–CALVIN ABC→D baseline：使用
-Qwen3-VL-4B-Instruct 作为视觉语言骨干、QwenPI_v3 layer-wise
-flow-matching cross-DiT 动作头，从 Bridge–RT-1 预训练权重初始化，冻结
-`qwen_vl_interface`，在转换后的 CALVIN ABC→D LeRobot 数据上训练 90,000
-steps，随后进行 CALVIN 闭环评测。
+本仓库保留两条已经完整跑通的 StarVLA–CALVIN ABC→D 链路：E0 baseline，
+以及最终的 Factorized Aligned-9 Spatial Intent（E1）。两者都使用冻结的
+Qwen3-VL-4B-Instruct、QwenPI layer-wise flow-matching Action DiT，并从同一个
+Bridge–RT-1 step-50k checkpoint 初始化动作路径。E1 额外预测短时域 XYZ、RPY
+与 gripper Intent，并通过九个深度对齐的 Query-FiLM router 注入 Action DiT。
 
-这份 README 只描述已验证的 E0 链路。90k 之后的续训、LoRA、VLM 解冻和新
-辅助 head 不属于本 baseline。
+仓库只保留复现 E0 和最终 E1 所需的代码、数据定义、配置、checkpoint、评测结果
+与课程材料；旧 E1-B/E1-C、11/23/35 sparse-query、entropy gate、恢复补丁和中间
+实验均已移除。
 
-## 1. 已完成结果
+## 1. 最终结果
 
 | 项目 | 配置/结果 |
 |---|---|
@@ -21,22 +22,26 @@ steps，随后进行 CALVIN 闭环评测。
 | 数据 | sixpigs CALVIN ABC→D LeRobot v2.1，离线转换为 scaled relative action |
 | 训练 | 2 GPUs，batch 8/GPU，global batch 16，90k steps，约 1.37 epoch |
 | 用时 | 约 38 h 34 min，约 1.54 s/step（2×RTX A6000） |
-| 500-chain ACL | **3.214 / 5** |
-| Task 1–5 success | **92.4%、78.0%、61.8%、50.6%、38.6%** |
+| Report canonical E0 ACL | **2.713 / 5** |
+| Report canonical E0 Success@1–5 | **88.4%、66.8%、50.2%、38.2%、27.8%** |
 
-对应统计文件是
-[`eval_logs/e0_abc_rel/baseline_90000steps_1.37epoch_500/results.json`](eval_logs/e0_abc_rel/baseline_90000steps_1.37epoch_500/results.json)。
+最终 report 使用同一组 500 条 CALVIN-D 五子任务序列进行比较：
 
+| 模型 | 平均完成链 | Success@1 | Success@2 | Success@3 | Success@4 | Success@5 |
+|---|---:|---:|---:|---:|---:|---:|
+| E0 baseline | 2.713 | 88.4% | 66.8% | 50.2% | 38.2% | 27.8% |
+| E1 aligned-9，60k | **3.240** | **93.0%** | **78.8%** | **61.8%** | **50.6%** | **39.8%** |
+| E1 aligned-9，90k | 3.130 | 90.2% | 76.2% | 59.6% | 48.4% | 38.6% |
 
-同一套 500-chain 序列上的 checkpoint 对比：
-
-| Checkpoint | ACL | Len-5 success |
-|---|---:|---:|
-| 6k | 0.634 | 0.0% |
-| 30k | 2.334 | 18.0% |
-| 60k | 2.714 | 27.8% |
-| **90k** | **3.214** | **38.6%** |
-| 90k + 额外 90k 续训 | 3.108 | 34.4% |
+课程要求的最终比较采用 E0 与 E1 90k；E1 60k 用于说明 checkpoint 敏感性。
+E0 的 report canonical 数据保存在历史命名目录
+[`baseline_60000steps_1.37epoch_500`](eval_logs/e0_abc_rel/baseline_60000steps_1.37epoch_500/results.json)，
+E1 对应
+[`aligned9_steps60000`](eval_logs/e1_factorized_intent/aligned9_steps60000_calvin500_intent_on_20260805/results.json)
+和
+[`aligned9_steps90000`](eval_logs/e1_factorized_intent/aligned9_steps90000_calvin500_intent_on_20260805/results.json)。
+这里保留原始目录名，不对历史产物重命名；论文口径以
+[`main_zh.tex`](plan/report/ieee_cv_final_project_template/main_zh.tex) 为准。
 
 ## 2. 目录约定
 
@@ -54,17 +59,22 @@ PROJECT_ROOT/
 ├── scripts/
 │   ├── e0_abc_rel/
 │   └── reference/Evo-1_sixpigs/
-└── eval_logs/e0_abc_rel/*/results.json
+└── eval_logs/
+    ├── e0_abc_rel/
+    └── e1_factorized_intent/
 
 DATA_ROOT/
 └── calvin/lerobot/
-    ├── sixpigs1_calvin2lerobotV21_ABC_D_scnet_raw/
-    └── sixpigs1_calvin2lerobotV21_ABC_D_scnet_rel_calvin_scaled/
+    ├── sixpigs1_calvin2lerobotV21_ABC_D_scnet_rel_calvin_scaled/
+    └── sixpigs1_calvin2lerobotV21_ABC_D_scnet_rel_calvin_scaled_intent_factorized_h8/
 
 MODEL_ROOT/
 ├── Qwen3-VL-4B-Instruct/
 ├── pretrained/starvla_qwenpi_pretrain_qwen3_4B_bridge-rt_1/
-└── checkpoints/calvin/e0_abc_rel/
+└── checkpoints/calvin/
+    ├── e0_abc_rel/
+    ├── e1_factorized_aligned9_spatial_intent_s0_50k/
+    └── e1_factorized_aligned9_query_s1_10k_s2_80k/
 ```
 
 ### 通用路径
@@ -447,7 +457,8 @@ test -f "$RUN_DIR/checkpoints/steps_90000_pytorch_model.pt"
 
 ### 8.1 评测资产
 
-本仓库报告的 ACL 3.214 使用 Evo-1_sixpigs 中的 config-only 环境目录：
+本仓库 report canonical E0 的 ACL 2.713 使用 Evo-1_sixpigs 中的
+config-only 环境目录：
 
 ```text
 $EVO_DIR/CALVIN_evaluation/ABC_D_validation/validation/.hydra/merged_config.yaml
@@ -509,7 +520,7 @@ python - <<'PY'
 import json
 from pathlib import Path
 
-p = Path("eval_logs/e0_abc_rel/baseline_90000steps_1.37epoch_500/results.json")
+p = Path("eval_logs/e0_abc_rel/baseline_60000steps_1.37epoch_500/results.json")
 r = json.loads(p.read_text())
 print(json.dumps(r, indent=2, ensure_ascii=False))
 PY
@@ -521,26 +532,96 @@ PY
 
 
 
-## 9. E1 Intent 系列
+## 9. E1 Factorized Aligned-9 Intent
 
-当前 vendored StarVLA 源码包含三套通过 YAML 开关选择的 Intent 实验：
+仓库只保留最终的 factorized aligned-9 实验。Intent head 从冻结 Qwen3-VL 的
+第 `3,7,11,15,19,23,27,31,35` 层提取特征，分别预测 XYZ、RPY 与 gripper
+分布；九个独立 Query-FiLM router 在 Action DiT 的相同九层注入条件。
 
-| 实验 | Action 条件方式 | 配置 |
-|---|---|---|
-| E1-B | 125 类 soft Intent 加入 timestep condition | `e1_b_abc_rel_calvin_scaled_intent125.yaml` |
-| E1-C | E1-B 加逐层 FFN-FiLM | `e1_c_abc_rel_calvin_scaled_intent125_ffn_film.yaml` |
-| Spatial Intent v2 | 九层两级 Query Transformer，配合 Query/FFN-FiLM | `e1_spatial_intent_*_query_ffn_v2*.yaml` |
+E1 使用 `125 + 125 + 5 = 255` 维 soft distribution：XYZ 和 RPY 分别是
+`5×5×5` 类，gripper 是 5 类。每个 router 使用
+`255 → 512 → SiLU → LayerNorm → ZeroLinear(2048)`，调制经过
+`0.1·tanh` 有界化；condition dropout 为 0.2，router peak LR 为 `2e-6`。
+完整流程如下。
 
-Spatial Intent v2 先独立训练 S0，再运行总计 90k Action optimizer steps 的
-S1/S2：
+### 9.1 构建 factorized Intent 数据与 trajectory split
+
+如果保留数据已经存在，只需检查；从 sixpigs scaled-relative 数据重新构建时运行：
 
 ```bash
-bash scripts/e1_abc_intent/train_e1_spatial_intent_s0_query_ffn_v2.sh
-bash scripts/e1_abc_intent/train_e1_spatial_intent_s1_s2_query_ffn_v2_90k.sh
+conda activate starvla-e0
+
+/home/liuchang/miniconda3/envs/starvla-e0/bin/python \
+  "$PROJECT_ROOT/scripts/e1_abc_intent/build_factorized_intent_dataset.py"
+
+test -f "$LEROBOT_ROOT/sixpigs1_calvin2lerobotV21_ABC_D_scnet_rel_calvin_scaled_intent_factorized_h8/meta/factorized_intent_config.json"
+test -f "$LEROBOT_ROOT/sixpigs1_calvin2lerobotV21_ABC_D_scnet_rel_calvin_scaled_intent_factorized_h8/meta/splits/factorized_seed42_train.json"
+test -f "$LEROBOT_ROOT/sixpigs1_calvin2lerobotV21_ABC_D_scnet_rel_calvin_scaled_intent_factorized_h8/meta/splits/factorized_seed42_val.json"
 ```
 
-启动脚本默认使用 `third_party/starvla`，只允许一到两张可见 GPU，并继承现有
-RAM/GPU watchdog。模型、数据集和 checkpoint 路径仍通过环境变量配置，不提交到 Git。
+ABC 按完整 trajectory、任务分层、seed 42 划分：16,080 条训练 trajectory、
+1,790 条验证 trajectory，二者无重叠；环境 D 不参与训练或 Intent validation。
+
+### 9.2 S0：Intent-only 50k
+
+S0 从 Bridge–RT-1 50k 初始化，冻结 Qwen 与完整 Action 路径，只执行并训练
+factorized Intent branch。两张 A6000、单卡 batch 32、global batch 64、warmup 5k；
+每 1k 做固定 validation subset，每 5k 做完整 validation，并保存
+`best_intent_pytorch_model.pt`。
+
+```bash
+conda activate starvla-e0
+
+CUDA_VISIBLE_DEVICES=2,3 \
+NUM_PROCESSES=2 \
+WANDB_MODE=online \
+bash "$PROJECT_ROOT/scripts/e1_abc_intent/train_e1_factorized_aligned9_spatial_intent_s0_50k.sh"
+```
+
+### 9.3 S1 10k + S2 80k：连续 90k
+
+Main run 的 Action 路径仍从原始 Bridge–RT-1 50k 初始化，Intent branch 单独加载
+S0 best checkpoint。S1 前 10k 冻结 Intent，训练 Action 与九个 router；S2 解冻
+Intent 并联合训练 80k。两个阶段共享同一个 90k cosine scheduler，不重置 LR。
+单卡 batch 4、两卡、gradient accumulation 2，global batch 16。
+
+```bash
+conda activate starvla-e0
+
+CUDA_VISIBLE_DEVICES=2,3 \
+NUM_PROCESSES=2 \
+WANDB_MODE=online \
+S0_INTENT_CHECKPOINT="$CHECKPOINT_ROOT/e1_factorized_aligned9_spatial_intent_s0_50k/checkpoints/best_intent_pytorch_model.pt" \
+bash "$PROJECT_ROOT/scripts/e1_abc_intent/train_e1_factorized_aligned9_query_s1_10k_s2_80k.sh"
+```
+
+两个训练启动器都是 fresh-only：不会覆盖已有 run，也不包含 weight-only recovery、
+step offset、LR restart 或 W&B continuation 补丁。可先设置 `CHECK_ONLY=true` 做
+路径和参数验证，它不会启动训练。
+
+### 9.4 E1 CALVIN-D 闭环评测
+
+评测脚本在同一 allocation 内启动 policy server 和 CALVIN client，固定 500 条序列、
+seed 42、`replan_steps=5`，并检查 client/server checkpoint 一致性：
+
+```bash
+conda activate starvla-e0
+
+CUDA_VISIBLE_DEVICES=1 CHECKPOINT_STEP=60000 DEBUG=false \
+bash "$PROJECT_ROOT/scripts/e1_abc_intent/eval_e1_factorized_aligned9.sh"
+
+CUDA_VISIBLE_DEVICES=1 CHECKPOINT_STEP=90000 DEBUG=false \
+bash "$PROJECT_ROOT/scripts/e1_abc_intent/eval_e1_factorized_aligned9.sh"
+```
+
+定性 rollout 才使用 `DEBUG=true` 生成 GIF；完整 500-sequence 统计建议设为 false。
+S0 validation 结果为：XYZ top-1/top-5/near-1 `40.0/76.4/86.4%`，RPY
+`25.1/54.0/71.9%`，gripper top-1 `87.3%`。
+
+更紧凑的端到端操作清单见
+[`README_ALIGNED9_PIPELINE.md`](scripts/e1_abc_intent/README_ALIGNED9_PIPELINE.md)，
+保留文件与 SHA-256 见
+[`CLEANUP_MANIFEST_20260810.md`](CLEANUP_MANIFEST_20260810.md)。
 
 ## 10. 主要来源
 

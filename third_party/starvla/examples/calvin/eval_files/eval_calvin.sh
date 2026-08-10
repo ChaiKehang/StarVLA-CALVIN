@@ -10,10 +10,10 @@ export calvin_python="${calvin_python:-/home/liuchang/miniconda3/envs/calvin-eva
 host="${host:-127.0.0.1}"
 base_port="${base_port:-5697}"
 unnorm_key="${unnorm_key:-franka}"
-your_ckpt="${your_ckpt:-/home/liuchang/kehang/488project/code/starvla/playground/Pretrained_models/kehang-StarVLA/checkpoints/calvin/e1_b_abc_rel_scaled_intent125_h8/checkpoints/steps_90000_pytorch_model.pt}"
+your_ckpt="${your_ckpt:-/home/data/models/kehang-StarVLA/checkpoints/calvin/e1_factorized_aligned9_query_s1_10k_s2_80k/checkpoints/steps_90000_pytorch_model.pt}"
 dataset_path="${dataset_path:-/home/liuchang/kehang/488project/scripts/reference/Evo-1_sixpigs/CALVIN_evaluation/ABC_D_validation}"
-calvin_config_path="${calvin_config_path:-/home/liuchang/kehang/488project/code/calvin/calvin_models/conf}"
-eval_sequences_path="${eval_sequences_path:-/home/liuchang/kehang/488project/code/starvla/examples/calvin/eval_files/eval_sequences.json}"
+calvin_config_path="${calvin_config_path:-/home/liuchang/kehang/488project/third_party/calvin/calvin_models/conf}"
+eval_sequences_path="${eval_sequences_path:-${STARVLA_DIR}/examples/calvin/eval_files/eval_sequences.json}"
 num_sequences="${num_sequences:-1}"
 sequence_start_index="${sequence_start_index:-0}"
 replan_steps="${replan_steps:-5}"
@@ -59,7 +59,7 @@ folder_name=$(echo "$your_ckpt" | awk -F'/' '{print $(NF-2)"_"$(NF-1)"_"$NF}')
 # === End of environment variable configuration ===
 ###########################################################################################
 
-LOG_DIR="${LOG_DIR:-/home/liuchang/kehang/488project/eval_logs/e1_b/${folder_name}_${condition_tag}_$(date +"%Y%m%d_%H%M%S")}"
+LOG_DIR="${LOG_DIR:-/home/liuchang/kehang/488project/eval_logs/e1_factorized_intent/${folder_name}_${condition_tag}_$(date +"%Y%m%d_%H%M%S")}"
 mkdir -p ${LOG_DIR}
 
 cd "${STARVLA_DIR}"

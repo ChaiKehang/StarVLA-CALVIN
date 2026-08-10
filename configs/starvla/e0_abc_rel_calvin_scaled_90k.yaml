@@ -19,8 +19,8 @@ framework:
   name: QwenPI_v3
 
   qwenvl:
-    # The generic launcher overrides this with an absolute path.
-    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    # Canonical local artifact retained by CLEANUP_MANIFEST_20260810.md.
+    base_vlm: /home/data/models/kehang-StarVLA/Qwen3-VL-4B-Instruct
     attn_implementation: flash_attention_2
     vl_hidden_dim: 2560
     num_vl_layers: 36
@@ -87,8 +87,7 @@ datasets:
   vla_data:
     dataset_py: lerobot_datasets
     include_state: false
-    # The generic launcher overrides this with an absolute path.
-    data_root_dir: ./playground/Datasets/kehang-CALVIN/calvin/lerobot
+    data_root_dir: /home/data/datasets/kehang-CALVIN/calvin/lerobot
     data_mix: calvin_abc_d_sixpigs_rel_scaled
     action_mode: abs
     action_type: calvin_scaled_rel_actions
@@ -101,7 +100,7 @@ trainer:
   # This is an independent 90k run initialized from the Bridge-RT-1 weights;
   # it is not a resume of the optimizer/scheduler state from that pretraining.
   is_resume: false
-  pretrained_checkpoint: ./playground/Pretrained_models/starvla_qwenpi_pretrain_qwen3_4b_bridge-rt_1/checkpoints/steps_50000_pytorch_model.pt
+  pretrained_checkpoint: /home/data/models/kehang-StarVLA/pretrained/starvla_qwenpi_pretrain_qwen3_4B_bridge-rt_1/checkpoints/steps_50000_pytorch_model.pt
 
   max_train_steps: 90000
   num_warmup_steps: 5000

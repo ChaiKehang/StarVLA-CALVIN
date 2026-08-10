@@ -9,7 +9,7 @@ version_id: "e1_factorized_aligned9_query_main_v1"
 framework:
   name: QwenPIIntent_v3
   qwenvl:
-    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    base_vlm: /home/data/models/kehang-StarVLA/Qwen3-VL-4B-Instruct
     attn_implementation: flash_attention_2
     vl_hidden_dim: 2048
   action_model:
